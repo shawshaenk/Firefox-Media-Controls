@@ -129,7 +129,7 @@
     const url = new URL(window.location.href);
     const videoId = url.searchParams.get("v") || "";
     if (url.pathname !== "/watch" || !/^[\w-]{11}$/.test(videoId)) {
-      return { videoId: "", chapters: [] };
+      return { videoId: "", chapters: [], status: "error" };
     }
     const textOf = (value) => {
       if (typeof value === "string") return value.trim();
@@ -180,7 +180,7 @@
       return [];
     };
     const current = fromData(window.ytInitialData);
-    if (current.length > 0) return { videoId, chapters: current };
+    if (current.length > 0) return { videoId, chapters: current, status: "available" };
     const domItems = document.querySelectorAll("ytd-macro-markers-list-item-renderer");
     if (domItems.length > 0) {
       const domRows = normalize(Array.from(domItems, (item) => {
@@ -191,7 +191,7 @@
           startTime: endpoint?.startTimeSeconds
         };
       }));
-      if (domRows.length > 0) return { videoId, chapters: domRows };
+      if (domRows.length > 0) return { videoId, chapters: domRows, status: "available" };
     }
     const controller = new AbortController();
     const timeout = window.setTimeout(() => controller.abort(), 7e3);
@@ -200,13 +200,13 @@
         credentials: "include",
         signal: controller.signal
       });
-      if (!response.ok) return { videoId, chapters: [] };
+      if (!response.ok) return { videoId, chapters: [], status: "error" };
       const html = await response.text();
       const marker = "var ytInitialData = ";
       const index = html.indexOf(marker);
-      if (index < 0) return { videoId, chapters: [] };
+      if (index < 0) return { videoId, chapters: [], status: "error" };
       const start = html.indexOf("{", index + marker.length);
-      if (start < 0) return { videoId, chapters: [] };
+      if (start < 0) return { videoId, chapters: [], status: "error" };
       let depth = 0;
       let quoted = false;
       let escaped = false;
@@ -221,15 +221,127 @@
         } else if (char === "{") {
           depth++;
         } else if (char === "}" && --depth === 0) {
-          const data = JSON.parse(html.slice(start, i + 1));
-          return { videoId, chapters: fromData(data) };
+          let data;
+          try {
+            data = JSON.parse(html.slice(start, i + 1));
+          } catch (_) {
+            return { videoId, chapters: [], status: "error" };
+          }
+          if (data?.currentVideoEndpoint?.watchEndpoint?.videoId !== videoId) {
+            return { videoId, chapters: [], status: "error" };
+          }
+          const rows = fromData(data);
+          return rows.length > 0 ? { videoId, chapters: rows, status: "available" } : { videoId, chapters: [], status: "none" };
         }
       }
+      return { videoId, chapters: [], status: "error" };
     } catch (_) {
+      return { videoId, chapters: [], status: "error" };
     } finally {
       window.clearTimeout(timeout);
     }
-    return { videoId, chapters: [] };
+  }
+  var chapterCache = /* @__PURE__ */ new Map();
+  var chapterInflight = /* @__PURE__ */ new Map();
+  var chapterAttempts = /* @__PURE__ */ new Map();
+  var chapterRetryDelays = [3e3, 1e4, 3e4];
+  var tabChapterVideo = /* @__PURE__ */ new Map();
+  function validateChapters(list) {
+    if (!Array.isArray(list)) return [];
+    return list.filter(
+      (chapter) => typeof chapter?.title === "string" && chapter.title.trim().length > 0 && chapter.title.length <= 200 && typeof chapter.startTime === "number" && Number.isFinite(chapter.startTime) && chapter.startTime >= 0 && chapter.startTime <= 7 * 24 * 3600
+    ).slice(0, 200);
+  }
+  function chapterVideoStillWanted(videoId) {
+    for (const info of tabsInfo.values()) {
+      if (youtubeWatchVideoId(info.url) === videoId) return true;
+    }
+    return false;
+  }
+  function chapterStateFor(videoId) {
+    if (!videoId) return null;
+    const cached = chapterCache.get(videoId);
+    return cached ? { videoId, status: cached.status } : null;
+  }
+  async function lookupYouTubeChapters(tabId, videoId) {
+    try {
+      let targetTabId = null;
+      if (youtubeWatchVideoId(tabsInfo.get(tabId)?.url) === videoId) {
+        targetTabId = tabId;
+      } else {
+        for (const [id, info] of tabsInfo.entries()) {
+          if (youtubeWatchVideoId(info.url) === videoId) {
+            targetTabId = id;
+            break;
+          }
+        }
+      }
+      if (targetTabId === null) return;
+      const tab = await browser.tabs.get(targetTabId).catch(() => null);
+      if (!tab || !isYouTubeVideoWatchUrl(tab.url) || youtubeWatchVideoId(tab.url) !== videoId) {
+        return;
+      }
+      const result = await browser.scripting.executeScript({
+        target: { tabId: targetTabId, frameIds: [0] },
+        world: "MAIN",
+        func: readYouTubeChaptersInPage
+      });
+      const page = result[0]?.result;
+      if (page?.videoId !== videoId || page.status !== "available" && page.status !== "none") {
+        throw new Error("chapter lookup failed");
+      }
+      if (page.status === "available") {
+        const chapters = validateChapters(page.chapters);
+        if (chapters.length === 0) throw new Error("chapter lookup failed");
+        if (chapterCache.size >= 100) {
+          const oldest = chapterCache.keys().next();
+          if (!oldest.done) chapterCache.delete(oldest.value);
+        }
+        chapterCache.set(videoId, { status: "available", chapters });
+      } else {
+        if (chapterCache.size >= 100) {
+          const oldest = chapterCache.keys().next();
+          if (!oldest.done) chapterCache.delete(oldest.value);
+        }
+        chapterCache.set(videoId, { status: "none", chapters: [] });
+      }
+      chapterAttempts.delete(videoId);
+      broadcastSessions();
+    } catch (err) {
+      const attempt = chapterAttempts.get(videoId) || 0;
+      if (attempt < chapterRetryDelays.length && chapterVideoStillWanted(videoId)) {
+        chapterAttempts.set(videoId, attempt + 1);
+        const retryTab = tabId;
+        const retryVideo = videoId;
+        setTimeout(() => {
+          chapterInflight.delete(retryVideo);
+          if (!chapterCache.has(retryVideo) && chapterVideoStillWanted(retryVideo)) {
+            void ensureYouTubeChapters(retryTab, retryVideo);
+          } else {
+            chapterAttempts.delete(retryVideo);
+          }
+        }, chapterRetryDelays[attempt]);
+      } else {
+        chapterAttempts.delete(videoId);
+      }
+    }
+  }
+  function ensureYouTubeChapters(tabId, videoId) {
+    if (!videoId || chapterCache.has(videoId)) return null;
+    const running = chapterInflight.get(videoId);
+    if (running) return running;
+    const task = lookupYouTubeChapters(tabId, videoId).finally(() => {
+      if (chapterInflight.get(videoId) === task) chapterInflight.delete(videoId);
+    });
+    chapterInflight.set(videoId, task);
+    return task;
+  }
+  function noteYouTubeVideo(tabId, urlStr) {
+    const videoId = youtubeWatchVideoId(urlStr);
+    if (!videoId) return;
+    if (tabChapterVideo.get(tabId) === videoId) return;
+    tabChapterVideo.set(tabId, videoId);
+    void ensureYouTubeChapters(tabId, videoId);
   }
   function recordYouTubeNavigation(tabId, previousUrl, nextUrl) {
     if (!previousUrl || !nextUrl || previousUrl === nextUrl) return;
@@ -454,7 +566,10 @@
           muted: Boolean(tab?.muted),
           degraded: false,
           pinned: false,
-          youtubeVideoId: isYouTubeVideoWatchUrl(tab?.url) ? youtubeWatchVideoId(tab?.url) || void 0 : void 0
+          youtubeVideoId: isYouTubeVideoWatchUrl(tab?.url) ? youtubeWatchVideoId(tab?.url) || void 0 : void 0,
+          chapterState: chapterStateFor(
+            isYouTubeVideoWatchUrl(tab?.url) ? youtubeWatchVideoId(tab?.url) || void 0 : void 0
+          )
         });
       }
     }
@@ -474,7 +589,8 @@
           audible: true,
           muted: Boolean(tab.muted),
           degraded: true,
-          pinned: false
+          pinned: false,
+          chapterState: null
         });
       }
     }
@@ -691,6 +807,7 @@
           favIconUrl: tab.favIconUrl || current.favIconUrl,
           url: tab.url || current.url
         });
+        noteYouTubeVideo(tab.id, tab.url || current.url);
         const hasFrames = registry.has(tab.id) && (registry.get(tab.id)?.size ?? 0) > 0;
         if (tab.audible && !hasFrames) {
           void injectScriptsIntoTab(tab.id);
@@ -747,6 +864,7 @@
             favIconUrl: sender.tab.favIconUrl ?? current.favIconUrl,
             url: sender.tab.url ?? current.url
           });
+          noteYouTubeVideo(tabId, sender.tab.url ?? current.url);
         }
         persistState();
         broadcastSessions();
@@ -794,6 +912,7 @@
       favIconUrl: changeInfo.favIconUrl ?? tab.favIconUrl ?? current.favIconUrl,
       url: changeInfo.url ?? tab.url ?? current.url
     });
+    noteYouTubeVideo(tabId, changeInfo.url ?? tab.url ?? current.url);
     if (changeInfo.status === "complete" || changeInfo.audible === true || changeInfo.url) {
       const hasFrames = registry.has(tabId) && (registry.get(tabId)?.size ?? 0) > 0;
       if (!hasFrames) {
@@ -816,6 +935,7 @@
     pinnedTabOrder = pinnedTabOrder.filter((id) => id !== tabId);
     youtubeVideoHistory.delete(tabId);
     youtubeBackTargets.delete(tabId);
+    tabChapterVideo.delete(tabId);
     persistState();
     broadcastSessions();
   });
@@ -964,29 +1084,34 @@
           await persistState();
           broadcastSessions();
         } else if (msg.type === "chapters-request") {
-          let videoId = youtubeWatchVideoId(tabsInfo.get(msg.tabId)?.url) || "";
+          const currentUrl = tabsInfo.get(msg.tabId)?.url;
+          let videoId = youtubeWatchVideoId(currentUrl) || "";
           let chapters = [];
+          let status = "error";
           try {
             const tab = await browser.tabs.get(msg.tabId);
             if (isYouTubeVideoWatchUrl(tab.url)) {
               videoId = youtubeWatchVideoId(tab.url) || "";
-              const result = await browser.scripting.executeScript({
-                target: { tabId: msg.tabId, frameIds: [0] },
-                world: "MAIN",
-                func: readYouTubeChaptersInPage
-              });
-              const page = result[0]?.result;
-              if (page?.videoId === videoId && Array.isArray(page.chapters)) {
-                chapters = page.chapters.filter(
-                  (chapter) => typeof chapter?.title === "string" && chapter.title.trim().length > 0 && chapter.title.length <= 200 && typeof chapter.startTime === "number" && Number.isFinite(chapter.startTime) && chapter.startTime >= 0 && chapter.startTime <= 7 * 24 * 3600
-                ).slice(0, 200);
+              const cached = chapterCache.get(videoId);
+              if (cached) {
+                status = cached.status;
+                chapters = cached.status === "available" ? [...cached.chapters] : [];
+              } else {
+                chapterAttempts.delete(videoId);
+                await ensureYouTubeChapters(msg.tabId, videoId);
+                const fresh = chapterCache.get(videoId);
+                if (fresh) {
+                  status = fresh.status;
+                  chapters = fresh.status === "available" ? [...fresh.chapters] : [];
+                }
               }
             }
           } catch (err) {
             console.warn("[MediaControls Background] Could not read YouTube chapters:", err);
+            status = "error";
           }
           try {
-            port.postMessage({ type: "chapters", tabId: msg.tabId, videoId, chapters });
+            port.postMessage({ type: "chapters", tabId: msg.tabId, videoId, chapters, status });
           } catch (_) {
           }
         } else if (msg.type === "request-sessions") {

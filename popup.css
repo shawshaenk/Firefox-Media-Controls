@@ -218,6 +218,18 @@ scrollbar {
   display: none;
 }
 
+/* Confirmed chapter-free (or still checking) videos: gray button that keeps
+   its hover tooltip and keyboard focus via aria-disabled instead of the
+   native disabled attribute, but never opens the section. */
+.card-chapters-btn.is-disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.card-chapters-btn.is-disabled:hover {
+  background-color: transparent;
+}
+
 .card-pin-btn:hover,
 .card-pin-btn:focus-visible,
 .card-chapters-btn:hover,

@@ -59,7 +59,8 @@
           audible: true,
           muted: Boolean(tab.mutedInfo?.muted),
           degraded: true,
-          pinned: false
+          pinned: false,
+          chapterState: null
         };
       });
       if (sessions.length > 0) updateSessionsView(sessions);
@@ -384,7 +385,9 @@
     chapterBtn.addEventListener("click", (e) => {
       e.stopPropagation();
       const videoId = cardDom.session.youtubeVideoId;
-      if (!videoId) return;
+      if (!videoId || cardDom.session.degraded) return;
+      const chapterState = cardDom.session.chapterState;
+      if (chapterState && chapterState.videoId === videoId && chapterState.status === "none") return;
       const willOpen = !cardDom.chaptersOpen;
       setChaptersOpen(cardDom, willOpen);
       if (willOpen) {
@@ -880,8 +883,37 @@
     card.chapterSection.hidden = !open;
     card.chapterBtn.classList.toggle("is-open", open);
     card.chapterBtn.setAttribute("aria-expanded", String(open));
-    card.chapterBtn.setAttribute("aria-label", open ? "Hide video chapters" : "Show video chapters");
-    card.chapterBtn.title = open ? "Hide video chapters" : "Show video chapters";
+    updateChaptersButton(card);
+  }
+  function updateChaptersButton(card) {
+    const btn = card.chapterBtn;
+    const videoId = card.session.youtubeVideoId ?? null;
+    const chapterState = card.session.chapterState;
+    if (videoId && chapterState && chapterState.videoId === videoId && chapterState.status === "none") {
+      btn.classList.add("is-disabled");
+      btn.setAttribute("aria-disabled", "true");
+      btn.setAttribute("aria-label", "This video has no chapters");
+      btn.title = "This video has no chapters";
+    } else {
+      btn.classList.remove("is-disabled");
+      btn.removeAttribute("aria-disabled");
+      btn.setAttribute("aria-label", card.chaptersOpen ? "Hide video chapters" : "Show video chapters");
+      btn.title = card.chaptersOpen ? "Hide video chapters" : "Show video chapters";
+    }
+  }
+  function applyChaptersResult(card, msg) {
+    if (card.session.tabId !== msg.tabId) return;
+    const currentVideoId = card.session.youtubeVideoId ?? null;
+    if (!currentVideoId || currentVideoId !== msg.videoId) return;
+    if (msg.status === "available") {
+      renderChapters(card, msg.videoId, msg.chapters);
+    } else if (msg.status === "none") {
+      if (card.chaptersOpen) {
+        renderChapters(card, msg.videoId, []);
+      }
+    } else if (card.chaptersOpen) {
+      showChapterMessage(card, "Could not load chapters");
+    }
   }
   function showChapterMessage(card, text) {
     const message = document.createElement("div");
@@ -1040,7 +1072,13 @@
     card.pinBtn.setAttribute("aria-label", session.pinned ? "Unpin card" : "Pin card to top");
     card.pinBtn.title = session.pinned ? "Unpin card" : "Pin card to top";
     card.chapterBtn.hidden = !session.youtubeVideoId || session.degraded;
+    const chapterState = session.chapterState;
+    const chapterKnown = !session.degraded && !!session.youtubeVideoId && !!chapterState && chapterState.videoId === session.youtubeVideoId;
+    if (!chapterKnown) {
+      card.chapterBtn.hidden = true;
+    }
     if (card.chapterBtn.hidden && card.chaptersOpen) setChaptersOpen(card, false);
+    updateChaptersButton(card);
     card.volumeSection.id = `volume-${session.tabId}`;
     card.volumeBtn.setAttribute("aria-controls", card.volumeSection.id);
     const hostname = session.hostname || "browser";
@@ -1261,7 +1299,8 @@
         audible: true,
         muted: false,
         degraded: false,
-        pinned: false
+        pinned: false,
+        chapterState: null
       };
       const mockSession2 = {
         tabId: 2,
@@ -1293,7 +1332,8 @@
         audible: false,
         muted: false,
         degraded: false,
-        pinned: false
+        pinned: false,
+        chapterState: null
       };
       const mockSession3 = {
         tabId: 3,
@@ -1305,7 +1345,8 @@
         audible: true,
         muted: false,
         degraded: true,
-        pinned: false
+        pinned: false,
+        chapterState: null
       };
       currentSessions = isMulti ? [mockSession1, mockSession2, mockSession3] : [mockSession1];
       updateSessionsView(currentSessions);
@@ -1324,8 +1365,8 @@
             if (currentSessions.length === 0) void showAudibleFallback();
           } else if (msg.type === "chapters") {
             const card = renderedCards.get(msg.tabId);
-            if (card?.chaptersOpen && card.session.youtubeVideoId === msg.videoId) {
-              renderChapters(card, msg.videoId, msg.chapters);
+            if (card) {
+              applyChaptersResult(card, msg);
             }
           }
         });

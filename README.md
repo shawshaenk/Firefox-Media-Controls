@@ -37,7 +37,7 @@ Build the XPI, then load it as a temporary add-on:
 2. Run `npm install` in this repository.
 3. Run `npm run package`.
 4. In Firefox, open `about:debugging#/runtime/this-firefox`.
-5. Choose **Load Temporary Add-on** and select `dist/media-controls-1.0.12.xpi`.
+5. Choose **Load Temporary Add-on** and select `dist/media-controls-1.0.0.xpi`.
 
 Temporary add-ons must be loaded again after restarting Firefox. This locally built XPI is not signed for permanent installation from the Add-ons Manager.
 
@@ -46,7 +46,7 @@ Temporary add-ons must be loaded again after restarting Firefox. This locally bu
 ```sh
 npm install
 npm run build       # Bundle the extension scripts
-npm run package     # Build and create dist/media-controls-1.0.12.xpi
+npm run package     # Build and create dist/media-controls-1.0.0.xpi
 npm run typecheck   # Check TypeScript types
 npm run lint        # Run web-ext lint
 ```

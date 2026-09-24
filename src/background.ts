@@ -164,15 +164,19 @@ function advanceYouTubeVideoInPage(): boolean {
 
 // Read chapters only when a popup asks for them. YouTube can keep its initial
 // data from an earlier video during in-page navigation, so verify the video ID
-// and fetch the current watch document if the in-page copy is stale.
+// and fetch the current watch document if the in-page copy is stale. The
+// status distinguishes a confirmed chapter-free video ("none") from a failed
+// lookup ("error"): fetch errors, timeouts, and stale page data are never
+// treated as proof that the video has no chapters.
 async function readYouTubeChaptersInPage(): Promise<{
   videoId: string;
   chapters: { title: string; startTime: number }[];
+  status: "available" | "none" | "error";
 }> {
   const url = new URL(window.location.href);
   const videoId = url.searchParams.get("v") || "";
   if (url.pathname !== "/watch" || !/^[\w-]{11}$/.test(videoId)) {
-    return { videoId: "", chapters: [] };
+    return { videoId: "", chapters: [], status: "error" };
   }
 
   const textOf = (value: any): string => {
@@ -229,7 +233,7 @@ async function readYouTubeChaptersInPage(): Promise<{
   };
 
   const current = fromData((window as any).ytInitialData);
-  if (current.length > 0) return { videoId, chapters: current };
+  if (current.length > 0) return { videoId, chapters: current, status: "available" as const };
 
   const domItems = document.querySelectorAll("ytd-macro-markers-list-item-renderer");
   if (domItems.length > 0) {
@@ -241,7 +245,7 @@ async function readYouTubeChaptersInPage(): Promise<{
         startTime: endpoint?.startTimeSeconds
       };
     }));
-    if (domRows.length > 0) return { videoId, chapters: domRows };
+    if (domRows.length > 0) return { videoId, chapters: domRows, status: "available" as const };
   }
 
   const controller = new AbortController();
@@ -251,13 +255,13 @@ async function readYouTubeChaptersInPage(): Promise<{
       credentials: "include",
       signal: controller.signal
     });
-    if (!response.ok) return { videoId, chapters: [] };
+    if (!response.ok) return { videoId, chapters: [], status: "error" as const };
     const html = await response.text();
     const marker = "var ytInitialData = ";
     const index = html.indexOf(marker);
-    if (index < 0) return { videoId, chapters: [] };
+    if (index < 0) return { videoId, chapters: [], status: "error" as const };
     const start = html.indexOf("{", index + marker.length);
-    if (start < 0) return { videoId, chapters: [] };
+    if (start < 0) return { videoId, chapters: [], status: "error" as const };
     let depth = 0;
     let quoted = false;
     let escaped = false;
@@ -272,16 +276,151 @@ async function readYouTubeChaptersInPage(): Promise<{
       } else if (char === "{") {
         depth++;
       } else if (char === "}" && --depth === 0) {
-        const data = JSON.parse(html.slice(start, i + 1));
-        return { videoId, chapters: fromData(data) };
+        let data: any;
+        try {
+          data = JSON.parse(html.slice(start, i + 1));
+        } catch (_) {
+          return { videoId, chapters: [], status: "error" as const };
+        }
+        // The fetched document must describe this video; anything else is
+        // stale data, not proof the video has no chapters.
+        if (data?.currentVideoEndpoint?.watchEndpoint?.videoId !== videoId) {
+          return { videoId, chapters: [], status: "error" as const };
+        }
+        const rows = fromData(data);
+        return rows.length > 0
+          ? { videoId, chapters: rows, status: "available" as const }
+          : { videoId, chapters: [], status: "none" as const };
       }
     }
+    return { videoId, chapters: [], status: "error" as const };
   } catch (_) {
     // The current page or its DOM may still provide chapters next time.
+    return { videoId, chapters: [], status: "error" as const };
   } finally {
     window.clearTimeout(timeout);
   }
-  return { videoId, chapters: [] };
+}
+
+// Proactive YouTube chapter detection. As soon as a new watch video ID is
+// seen, its chapters are read once and cached per video ("has chapters" or
+// "no chapters"); the cached result is attached to the card's session data.
+// A failed lookup is never cached as "no chapters" — it is retried with
+// backoff while some tab still shows that video.
+const chapterCache = new Map<string, { status: "available" | "none"; chapters: YouTubeChapter[] }>();
+const chapterInflight = new Map<string, Promise<void>>();
+const chapterAttempts = new Map<string, number>();
+const chapterRetryDelays = [3000, 10000, 30000];
+const tabChapterVideo = new Map<number, string>();
+
+function validateChapters(list: unknown): YouTubeChapter[] {
+  if (!Array.isArray(list)) return [];
+  return list.filter((chapter: any): chapter is YouTubeChapter =>
+    typeof chapter?.title === "string" && chapter.title.trim().length > 0 &&
+    chapter.title.length <= 200 && typeof chapter.startTime === "number" &&
+    Number.isFinite(chapter.startTime) && chapter.startTime >= 0 &&
+    chapter.startTime <= 7 * 24 * 3600
+  ).slice(0, 200);
+}
+
+function chapterVideoStillWanted(videoId: string): boolean {
+  for (const info of tabsInfo.values()) {
+    if (youtubeWatchVideoId(info.url) === videoId) return true;
+  }
+  return false;
+}
+
+function chapterStateFor(videoId: string | undefined): { videoId: string; status: "available" | "none" } | null {
+  if (!videoId) return null;
+  const cached = chapterCache.get(videoId);
+  return cached ? { videoId, status: cached.status } : null;
+}
+
+async function lookupYouTubeChapters(tabId: number, videoId: string): Promise<void> {
+  try {
+    // Prefer the triggering tab, but any tab currently on this video works.
+    let targetTabId: number | null = null;
+    if (youtubeWatchVideoId(tabsInfo.get(tabId)?.url) === videoId) {
+      targetTabId = tabId;
+    } else {
+      for (const [id, info] of tabsInfo.entries()) {
+        if (youtubeWatchVideoId(info.url) === videoId) {
+          targetTabId = id;
+          break;
+        }
+      }
+    }
+    if (targetTabId === null) return;
+    const tab = await browser.tabs.get(targetTabId).catch(() => null);
+    if (!tab || !isYouTubeVideoWatchUrl(tab.url) || youtubeWatchVideoId(tab.url) !== videoId) {
+      // Navigated away already; ignore this result entirely.
+      return;
+    }
+    const result = await browser.scripting.executeScript({
+      target: { tabId: targetTabId, frameIds: [0] },
+      world: "MAIN" as any,
+      func: readYouTubeChaptersInPage as () => void
+    });
+    const page = result[0]?.result as { videoId?: unknown; chapters?: unknown; status?: unknown } | undefined;
+    if (page?.videoId !== videoId || (page.status !== "available" && page.status !== "none")) {
+      throw new Error("chapter lookup failed");
+    }
+    if (page.status === "available") {
+      const chapters = validateChapters(page.chapters);
+      if (chapters.length === 0) throw new Error("chapter lookup failed");
+      if (chapterCache.size >= 100) {
+        const oldest = chapterCache.keys().next();
+        if (!oldest.done) chapterCache.delete(oldest.value);
+      }
+      chapterCache.set(videoId, { status: "available", chapters });
+    } else {
+      if (chapterCache.size >= 100) {
+        const oldest = chapterCache.keys().next();
+        if (!oldest.done) chapterCache.delete(oldest.value);
+      }
+      chapterCache.set(videoId, { status: "none", chapters: [] });
+    }
+    chapterAttempts.delete(videoId);
+    broadcastSessions();
+  } catch (err) {
+    // Never classify a failure as "no chapters"; retry while wanted.
+    const attempt = chapterAttempts.get(videoId) || 0;
+    if (attempt < chapterRetryDelays.length && chapterVideoStillWanted(videoId)) {
+      chapterAttempts.set(videoId, attempt + 1);
+      const retryTab = tabId;
+      const retryVideo = videoId;
+      setTimeout(() => {
+        chapterInflight.delete(retryVideo);
+        if (!chapterCache.has(retryVideo) && chapterVideoStillWanted(retryVideo)) {
+          void ensureYouTubeChapters(retryTab, retryVideo);
+        } else {
+          chapterAttempts.delete(retryVideo);
+        }
+      }, chapterRetryDelays[attempt]);
+    } else {
+      chapterAttempts.delete(videoId);
+    }
+  }
+}
+
+function ensureYouTubeChapters(tabId: number, videoId: string): Promise<void> | null {
+  if (!videoId || chapterCache.has(videoId)) return null;
+  const running = chapterInflight.get(videoId);
+  if (running) return running;
+  const task = lookupYouTubeChapters(tabId, videoId).finally(() => {
+    if (chapterInflight.get(videoId) === task) chapterInflight.delete(videoId);
+  });
+  chapterInflight.set(videoId, task);
+  return task;
+}
+
+// Record a newly seen watch video ID for a tab and start detection once.
+function noteYouTubeVideo(tabId: number, urlStr?: string) {
+  const videoId = youtubeWatchVideoId(urlStr);
+  if (!videoId) return;
+  if (tabChapterVideo.get(tabId) === videoId) return;
+  tabChapterVideo.set(tabId, videoId);
+  void ensureYouTubeChapters(tabId, videoId);
 }
 
 function recordYouTubeNavigation(tabId: number, previousUrl?: string, nextUrl?: string) {
@@ -552,7 +691,11 @@ function resolveSessions(): Session[] {
         degraded: false,
         pinned: false,
         youtubeVideoId: isYouTubeVideoWatchUrl(tab?.url)
-          ? youtubeWatchVideoId(tab?.url) || undefined : undefined
+          ? youtubeWatchVideoId(tab?.url) || undefined : undefined,
+        chapterState: chapterStateFor(
+          isYouTubeVideoWatchUrl(tab?.url)
+            ? youtubeWatchVideoId(tab?.url) || undefined : undefined
+        )
       });
     }
   }
@@ -574,7 +717,8 @@ function resolveSessions(): Session[] {
         audible: true,
         muted: Boolean(tab.muted),
         degraded: true,
-        pinned: false
+        pinned: false,
+        chapterState: null
       });
     }
   }
@@ -829,6 +973,7 @@ async function refreshTabsAndInject() {
         favIconUrl: tab.favIconUrl || current.favIconUrl,
         url: tab.url || current.url
       });
+      noteYouTubeVideo(tab.id, tab.url || current.url);
 
       // If tab is audible or might have media, inject scripts if no frame state exists
       const hasFrames = registry.has(tab.id) && (registry.get(tab.id)?.size ?? 0) > 0;
@@ -897,6 +1042,7 @@ browser.runtime.onMessage.addListener(
           favIconUrl: sender.tab.favIconUrl ?? current.favIconUrl,
           url: sender.tab.url ?? current.url
         });
+        noteYouTubeVideo(tabId, sender.tab.url ?? current.url);
       }
 
       persistState();
@@ -958,6 +1104,7 @@ browser.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
     favIconUrl: changeInfo.favIconUrl ?? tab.favIconUrl ?? current.favIconUrl,
     url: changeInfo.url ?? tab.url ?? current.url
   });
+  noteYouTubeVideo(tabId, changeInfo.url ?? tab.url ?? current.url);
 
   // If tab finished loading, changed URL, or became audible, inject and query
   if (changeInfo.status === "complete" || changeInfo.audible === true || changeInfo.url) {
@@ -985,6 +1132,7 @@ browser.tabs.onRemoved.addListener(async (tabId) => {
   pinnedTabOrder = pinnedTabOrder.filter((id) => id !== tabId);
   youtubeVideoHistory.delete(tabId);
   youtubeBackTargets.delete(tabId);
+  tabChapterVideo.delete(tabId);
   persistState();
   broadcastSessions();
 });
@@ -1151,32 +1299,36 @@ browser.runtime.onConnect.addListener((port) => {
         await persistState();
         broadcastSessions();
       } else if (msg.type === "chapters-request") {
-        let videoId = youtubeWatchVideoId(tabsInfo.get(msg.tabId)?.url) || "";
+        // Chapter lists are served from the proactive per-video cache. An
+        // explicit popup request also (re)starts detection when uncached.
+        const currentUrl = tabsInfo.get(msg.tabId)?.url;
+        let videoId = youtubeWatchVideoId(currentUrl) || "";
         let chapters: YouTubeChapter[] = [];
+        let status: "available" | "none" | "error" = "error";
         try {
           const tab = await browser.tabs.get(msg.tabId);
           if (isYouTubeVideoWatchUrl(tab.url)) {
             videoId = youtubeWatchVideoId(tab.url) || "";
-            const result = await browser.scripting.executeScript({
-              target: { tabId: msg.tabId, frameIds: [0] },
-              world: "MAIN" as any,
-              func: readYouTubeChaptersInPage as () => void
-            });
-            const page = result[0]?.result as { videoId?: unknown; chapters?: unknown } | undefined;
-            if (page?.videoId === videoId && Array.isArray(page.chapters)) {
-              chapters = page.chapters.filter((chapter: any): chapter is YouTubeChapter =>
-                typeof chapter?.title === "string" && chapter.title.trim().length > 0 &&
-                chapter.title.length <= 200 && typeof chapter.startTime === "number" &&
-                Number.isFinite(chapter.startTime) && chapter.startTime >= 0 &&
-                chapter.startTime <= 7 * 24 * 3600
-              ).slice(0, 200);
+            const cached = chapterCache.get(videoId);
+            if (cached) {
+              status = cached.status;
+              chapters = cached.status === "available" ? [...cached.chapters] : [];
+            } else {
+              chapterAttempts.delete(videoId);
+              await ensureYouTubeChapters(msg.tabId, videoId);
+              const fresh = chapterCache.get(videoId);
+              if (fresh) {
+                status = fresh.status;
+                chapters = fresh.status === "available" ? [...fresh.chapters] : [];
+              }
             }
           }
         } catch (err) {
           console.warn("[MediaControls Background] Could not read YouTube chapters:", err);
+          status = "error";
         }
         try {
-          port.postMessage({ type: "chapters", tabId: msg.tabId, videoId, chapters } as BgToPopupMessage);
+          port.postMessage({ type: "chapters", tabId: msg.tabId, videoId, chapters, status } as BgToPopupMessage);
         } catch (_) {}
       } else if (msg.type === "request-sessions") {
         await refreshTabsAndInject();

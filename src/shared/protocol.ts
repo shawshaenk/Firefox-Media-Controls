@@ -66,11 +66,21 @@ export interface Session {
   degraded: boolean;
   pinned: boolean;
   youtubeVideoId?: string;
+  chapterState: ChapterState | null;
 }
 
 export interface YouTubeChapter {
   title: string;
   startTime: number;
+}
+
+// Cached YouTube chapter availability for one video, attached to the card's
+// session data. `status` is only ever "available" or "none": a failed lookup
+// is never classified as "no chapters" (it stays absent/unknown and is
+// retried). Absent (null) means the lookup has not finished yet.
+export interface ChapterState {
+  videoId: string;
+  status: "available" | "none";
 }
 
 // MAIN -> relay: { __mcx: "up", state: FrameState | null }
@@ -105,6 +115,8 @@ export type PopupToBgMessage =
   | { type: "request-sessions" };
 
 // bg -> popup (via port):
+// chapters status: "available" (chapters present), "none" (video confirmed
+// to have no chapters), or "error" (lookup failed — not proof of absence).
 export type BgToPopupMessage =
   | { type: "sessions"; sessions: Session[] }
-  | { type: "chapters"; tabId: number; videoId: string; chapters: YouTubeChapter[] };
+  | { type: "chapters"; tabId: number; videoId: string; chapters: YouTubeChapter[]; status: "available" | "none" | "error" };

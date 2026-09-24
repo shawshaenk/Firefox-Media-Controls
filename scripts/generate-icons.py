@@ -7,11 +7,11 @@ scale = 16
 for name, color in (("active", "#FFFFFF"), ("idle", "#FFFFFF")):
     canvas = Image.new("RGBA", (48 * scale, 48 * scale))
     draw = ImageDraw.Draw(canvas)
-    polygon = [(17, 9), (43, 3), (43, 11), (17, 17)]
+    polygon = [(17, 7), (43, 1), (43, 9), (17, 15)]
     draw.polygon([(x * scale, y * scale) for x, y in polygon], fill=color)
-    draw.rectangle((17 * scale, 14 * scale, 21 * scale, 36 * scale), fill=color)
-    draw.rectangle((39 * scale, 8 * scale, 43 * scale, 30 * scale), fill=color)
-    for x, y in ((12, 36), (34, 30)):
+    draw.rectangle((17 * scale, 12 * scale, 21 * scale, 40 * scale), fill=color)
+    draw.rectangle((39 * scale, 6 * scale, 43 * scale, 34 * scale), fill=color)
+    for x, y in ((12, 40), (34, 34)):
         head = Image.new("RGBA", (16 * scale, 10 * scale))
         ImageDraw.Draw(head).ellipse((0, 0, 16 * scale - 1, 10 * scale - 1), fill=color)
         rotated = head.rotate(24, Image.Resampling.BICUBIC, expand=True)

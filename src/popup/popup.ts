@@ -97,7 +97,7 @@ async function showAudibleFallback() {
         tabId: tab.id!, frameId: 0, hostname,
         favIconUrl: tab.favIconUrl || "", tabTitle: tab.title || "Audible tab",
         state: null, audible: true, muted: Boolean(tab.mutedInfo?.muted), degraded: true,
-        pinned: false
+        pinned: false, chapterState: null
       };
     });
     if (sessions.length > 0) updateSessionsView(sessions);
@@ -499,7 +499,10 @@ function createCardDom(session: Session): CardDom {
   chapterBtn.addEventListener("click", (e) => {
     e.stopPropagation();
     const videoId = cardDom.session.youtubeVideoId;
-    if (!videoId) return;
+    if (!videoId || cardDom.session.degraded) return;
+    // A video the background confirmed to have no chapters never opens.
+    const chapterState = cardDom.session.chapterState;
+    if (chapterState && chapterState.videoId === videoId && chapterState.status === "none") return;
     const willOpen = !cardDom.chaptersOpen;
     setChaptersOpen(cardDom, willOpen);
     if (willOpen) {
@@ -1075,8 +1078,52 @@ function setChaptersOpen(card: CardDom, open: boolean) {
   card.chapterSection.hidden = !open;
   card.chapterBtn.classList.toggle("is-open", open);
   card.chapterBtn.setAttribute("aria-expanded", String(open));
-  card.chapterBtn.setAttribute("aria-label", open ? "Hide video chapters" : "Show video chapters");
-  card.chapterBtn.title = open ? "Hide video chapters" : "Show video chapters";
+  updateChaptersButton(card);
+}
+
+// Sets the chapter button label, tooltip, and disabled appearance from the
+// chapter state the background attached to the card's session. Uses
+// aria-disabled (not the native disabled attribute) so the button keeps its
+// hover tooltip and keyboard focus while refusing to open.
+function updateChaptersButton(card: CardDom) {
+  const btn = card.chapterBtn;
+  const videoId = card.session.youtubeVideoId ?? null;
+  const chapterState = card.session.chapterState;
+  if (
+    videoId && chapterState && chapterState.videoId === videoId &&
+    chapterState.status === "none"
+  ) {
+    btn.classList.add("is-disabled");
+    btn.setAttribute("aria-disabled", "true");
+    btn.setAttribute("aria-label", "This video has no chapters");
+    btn.title = "This video has no chapters";
+  } else {
+    btn.classList.remove("is-disabled");
+    btn.removeAttribute("aria-disabled");
+    btn.setAttribute("aria-label", card.chaptersOpen ? "Hide video chapters" : "Show video chapters");
+    btn.title = card.chaptersOpen ? "Hide video chapters" : "Show video chapters";
+  }
+}
+
+// Stores a chapter list response for the open section. Responses for a video
+// the card no longer shows are ignored so an old response can never affect
+// the new video. Button state itself comes from the session data.
+function applyChaptersResult(
+  card: CardDom,
+  msg: { tabId: number; videoId: string; chapters: YouTubeChapter[]; status: "available" | "none" | "error" }
+) {
+  if (card.session.tabId !== msg.tabId) return;
+  const currentVideoId = card.session.youtubeVideoId ?? null;
+  if (!currentVideoId || currentVideoId !== msg.videoId) return;
+  if (msg.status === "available") {
+    renderChapters(card, msg.videoId, msg.chapters);
+  } else if (msg.status === "none") {
+    if (card.chaptersOpen) {
+      renderChapters(card, msg.videoId, []);
+    }
+  } else if (card.chaptersOpen) {
+    showChapterMessage(card, "Could not load chapters");
+  }
 }
 
 function showChapterMessage(card: CardDom, text: string) {
@@ -1262,7 +1309,17 @@ function updateCardDom(card: CardDom, session: Session) {
   card.pinBtn.setAttribute("aria-label", session.pinned ? "Unpin card" : "Pin card to top");
   card.pinBtn.title = session.pinned ? "Unpin card" : "Pin card to top";
   card.chapterBtn.hidden = !session.youtubeVideoId || session.degraded;
+  // Chapter availability arrives with the session data from the background.
+  // While a first-time lookup is still running the result is unknown, so the
+  // button stays hidden; it appears only once the result is known.
+  const chapterState = session.chapterState;
+  const chapterKnown = !session.degraded && !!session.youtubeVideoId &&
+    !!chapterState && chapterState.videoId === session.youtubeVideoId;
+  if (!chapterKnown) {
+    card.chapterBtn.hidden = true;
+  }
   if (card.chapterBtn.hidden && card.chaptersOpen) setChaptersOpen(card, false);
+  updateChaptersButton(card);
   card.volumeSection.id = `volume-${session.tabId}`;
   card.volumeBtn.setAttribute("aria-controls", card.volumeSection.id);
 
@@ -1540,7 +1597,8 @@ async function initPopup() {
       audible: true,
       muted: false,
       degraded: false,
-      pinned: false
+      pinned: false,
+      chapterState: null
     };
 
     const mockSession2: Session = {
@@ -1573,7 +1631,8 @@ async function initPopup() {
       audible: false,
       muted: false,
       degraded: false,
-      pinned: false
+      pinned: false,
+      chapterState: null
     };
 
     const mockSession3: Session = {
@@ -1586,7 +1645,8 @@ async function initPopup() {
       audible: true,
       muted: false,
       degraded: true,
-      pinned: false
+      pinned: false,
+      chapterState: null
     };
 
     currentSessions = isMulti ? [mockSession1, mockSession2, mockSession3] : [mockSession1];
@@ -1608,8 +1668,8 @@ async function initPopup() {
           if (currentSessions.length === 0) void showAudibleFallback();
         } else if (msg.type === "chapters") {
           const card = renderedCards.get(msg.tabId);
-          if (card?.chaptersOpen && card.session.youtubeVideoId === msg.videoId) {
-            renderChapters(card, msg.videoId, msg.chapters);
+          if (card) {
+            applyChaptersResult(card, msg);
           }
         }
       });

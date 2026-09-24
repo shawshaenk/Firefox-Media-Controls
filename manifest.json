@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Media Controls",
-  "version": "1.0.12",
+  "version": "1.0.0",
   "description": "Global media controls panel for tabs playing audio.",
   "browser_specific_settings": {
     "gecko": {
@@ -30,6 +30,11 @@
       "48": "icons/idle-48.png"
     },
     "default_title": "No media playing"
+  },
+  "icons": {
+    "16": "icons/idle-16.png",
+    "32": "icons/idle-32.png",
+    "48": "icons/idle-48.png"
   },
   "commands": {
     "_execute_action": {
