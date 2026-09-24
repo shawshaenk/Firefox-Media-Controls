@@ -929,7 +929,7 @@ import type {
     }
 
     // Some players (including Spotify) replace or clear their media element on
-    // pause. Preserve the last playable card until navigation or retention expiry.
+    // pause. Preserve the last playable card until navigation or the page clears it.
     if (
       hasEverPlayedMediaSession &&
       currentFrameState &&
@@ -1134,21 +1134,39 @@ import type {
     try {
       const currentId = getYouTubeVideoId();
       if (!currentId || window.location.pathname !== "/watch") return null;
+      const idFromHref = (href: string | null): string | null => {
+        if (!href) return null;
+        const url = new URL(href, window.location.href);
+        const id = url.searchParams.get("v");
+        return /(^|\.)youtube\.com$/.test(url.hostname) && url.pathname === "/watch" &&
+          id && /^[\w-]{11}$/.test(id) && id !== currentId ? id : null;
+      };
       const data = (window as any).ytInitialData;
       const dataCurrentId = data?.currentVideoEndpoint?.watchEndpoint?.videoId;
-      // During SPA navigation ytInitialData can briefly describe the old video.
-      if (dataCurrentId && dataCurrentId !== currentId) return null;
       const nextHref = document.querySelector<HTMLAnchorElement>("a.ytp-next-button[href]")?.href;
-      if (nextHref) {
-        const nextUrl = new URL(nextHref, window.location.href);
-        const linkId = /(^|\.)youtube\.com$/.test(nextUrl.hostname) && nextUrl.pathname === "/watch"
-          ? nextUrl.searchParams.get("v") : null;
-        if (linkId && /^[\w-]{11}$/.test(linkId) && linkId !== currentId) return linkId;
+      const linkId = idFromHref(nextHref ?? null);
+      if (linkId) return linkId;
+      // ytInitialData may still describe the previous video after YouTube's
+      // in-page navigation. Ignore that copy and inspect current DOM links.
+      if (!dataCurrentId || dataCurrentId === currentId) {
+        const sets = data?.contents?.twoColumnWatchNextResults?.autoplay?.autoplay?.sets;
+        if (Array.isArray(sets)) {
+          for (const set of sets) {
+            const nextId = set?.autoplayVideo?.watchEndpoint?.videoId;
+            if (typeof nextId === "string" && /^[\w-]{11}$/.test(nextId) && nextId !== currentId) {
+              return nextId;
+            }
+          }
+        }
       }
-      const sets = data?.contents?.twoColumnWatchNextResults?.autoplay?.autoplay?.sets;
-      const nextId = sets?.[0]?.autoplayVideo?.watchEndpoint?.videoId;
-      return typeof nextId === "string" && /^[\w-]{11}$/.test(nextId) && nextId !== currentId
-        ? nextId : null;
+      const recommendations = document.querySelectorAll<HTMLAnchorElement>(
+        "#secondary a[href*='/watch?'], #related a[href*='/watch?']"
+      );
+      for (const link of recommendations) {
+        const id = idFromHref(link.getAttribute("href"));
+        if (id) return id;
+      }
+      return null;
     } catch (_) {
       return null;
     }

@@ -184,10 +184,10 @@ scrollbar {
   pointer-events: none;
 }
 
-.card-pin-btn {
+.card-pin-btn,
+.card-chapters-btn {
   position: absolute;
   top: 10px;
-  right: 40px;
   width: 24px;
   height: 24px;
   display: flex;
@@ -201,8 +201,22 @@ scrollbar {
   z-index: 2;
 }
 
+.card-pin-btn {
+  right: 40px;
+}
+
+.card-chapters-btn {
+  right: 64px;
+}
+
+.card-chapters-btn[hidden] {
+  display: none;
+}
+
 .card-pin-btn:hover,
-.card-pin-btn:focus-visible {
+.card-pin-btn:focus-visible,
+.card-chapters-btn:hover,
+.card-chapters-btn:focus-visible {
   background-color: var(--state-layer-hover);
 }
 
@@ -210,15 +224,25 @@ scrollbar {
   color: var(--slider-active);
 }
 
-.card-pin-btn:focus-visible {
+.card-pin-btn:focus-visible,
+.card-chapters-btn:focus-visible {
   outline: 2px solid var(--focus-ring);
   outline-offset: 1px;
 }
 
-.card-pin-btn svg {
+.card-pin-btn svg,
+.card-chapters-btn svg {
   width: 17px;
   height: 17px;
   pointer-events: none;
+}
+
+.card-chapters-btn svg {
+  transition: transform 0.15s ease;
+}
+
+.card-chapters-btn.is-open svg {
+  transform: rotate(180deg);
 }
 
 /* Top Row */
@@ -444,6 +468,97 @@ scrollbar {
 
 .next-btn {
   margin-left: 4px;
+}
+
+/* YouTube chapters expand below the transport controls. */
+.chapter-section {
+  margin-top: 12px;
+  padding-top: 8px;
+  border-top: 1px solid var(--slider-inactive);
+  min-width: 0;
+}
+
+.chapter-section[hidden] {
+  display: none;
+}
+
+.chapter-heading {
+  color: var(--text-source);
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 20px;
+  margin: 0 4px 4px;
+}
+
+.chapter-list {
+  max-height: 156px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+  scrollbar-color: var(--scrollbar-thumb) transparent;
+}
+
+.chapter-list::-webkit-scrollbar {
+  width: 6px;
+}
+
+.chapter-list::-webkit-scrollbar-thumb {
+  background: var(--scrollbar-thumb);
+  border-radius: 3px;
+}
+
+.chapter-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  min-height: 36px;
+  padding: 7px 8px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-title);
+  font: inherit;
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.chapter-row:hover,
+.chapter-row:focus-visible {
+  background: var(--state-layer-hover);
+}
+
+.chapter-row:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: -2px;
+}
+
+.chapter-row.is-current {
+  background: var(--play-btn-bg);
+  box-shadow: inset 2px 0 var(--slider-active);
+}
+
+.chapter-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chapter-time {
+  color: var(--text-artist);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
+}
+
+.chapter-message {
+  color: var(--text-artist);
+  font-size: 13px;
+  line-height: 18px;
+  padding: 8px 6px 12px;
 }
 
 /* Material 3 Slider */

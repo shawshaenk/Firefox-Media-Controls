@@ -5,7 +5,8 @@ import type {
   PopupToBgMessage,
   BgToPopupMessage,
   RelayToBgMessage,
-  BgToRelayMessage
+  BgToRelayMessage,
+  YouTubeChapter
 } from "./shared/protocol";
 
 interface TabInfo {
@@ -26,6 +27,7 @@ let customTabOrder: number[] = [];
 // URLs let a user-defined order survive a browser restart, when tab IDs change.
 let customOrderUrls: string[] = [];
 const pinnedTabIds = new Set<number>();
+let pinnedTabOrder: number[] = [];
 let pinnedUrls: string[] = [];
 let openTabIds = new Set<number>();
 const playbackCommandQueues = new Map<number, Promise<void>>();
@@ -44,6 +46,244 @@ function youtubeWatchVideoId(urlStr?: string): string | null {
   }
 }
 
+function isYouTubeVideoWatchUrl(urlStr?: string): boolean {
+  try {
+    if (!urlStr) return false;
+    const url = new URL(urlStr);
+    return /^(www\.|m\.)?youtube\.com$/.test(url.hostname) &&
+      url.pathname === "/watch" && Boolean(youtubeWatchVideoId(urlStr));
+  } catch (_) {
+    return false;
+  }
+}
+
+// Runs in the page's MAIN world for each Next press. It deliberately reads the
+// current page instead of relying on a cached action list from the content hook.
+function advanceYouTubeVideoInPage(): boolean {
+  const currentUrl = new URL(window.location.href);
+  const currentId = currentUrl.searchParams.get("v");
+  if (currentUrl.pathname !== "/watch" || !currentId) return false;
+
+  const validId = (id: unknown): id is string =>
+    typeof id === "string" && /^[\w-]{11}$/.test(id) && id !== currentId;
+  const idFromHref = (href: string | null | undefined): string | null => {
+    if (!href) return null;
+    try {
+      const url = new URL(href, currentUrl);
+      const id = url.searchParams.get("v");
+      return /(^|\.)youtube\.com$/.test(url.hostname) &&
+        url.pathname === "/watch" && validId(id) ? id : null;
+    } catch (_) {
+      return null;
+    }
+  };
+
+  const player = document.getElementById("movie_player") as any;
+  let nextId: string | null = null;
+  let playlistNextId: string | null = null;
+  try {
+    const playlist = player?.getPlaylist?.();
+    const index = player?.getPlaylistIndex?.();
+    if (currentUrl.searchParams.has("list") && Array.isArray(playlist) &&
+        Number.isInteger(index) && index >= 0) {
+      const candidate = playlist[index + 1];
+      if (validId(candidate)) {
+        nextId = candidate;
+        playlistNextId = candidate;
+      }
+    }
+  } catch (_) {}
+
+  const nextButton = document.querySelector<HTMLElement>(".ytp-next-button");
+  nextId ||= idFromHref(nextButton?.getAttribute("href"));
+
+  const data = (window as any).ytInitialData;
+  const dataCurrentId = data?.currentVideoEndpoint?.watchEndpoint?.videoId;
+  if (!nextId && (!dataCurrentId || dataCurrentId === currentId)) {
+    const sets = data?.contents?.twoColumnWatchNextResults?.autoplay?.autoplay?.sets;
+    if (Array.isArray(sets)) {
+      for (const set of sets) {
+        const candidate = set?.autoplayVideo?.watchEndpoint?.videoId;
+        if (validId(candidate)) {
+          nextId = candidate;
+          break;
+        }
+      }
+    }
+  }
+
+  if (!nextId) {
+    const recommendations = document.querySelectorAll<HTMLAnchorElement>(
+      "#secondary a[href*='/watch?'], #related a[href*='/watch?'], " +
+      "ytd-watch-next-secondary-results-renderer a[href*='/watch?']"
+    );
+    for (const link of recommendations) {
+      nextId = idFromHref(link.getAttribute("href"));
+      if (nextId) break;
+    }
+  }
+
+  let attemptedPlayerControl = false;
+  if (playlistNextId &&
+      typeof player?.nextVideo === "function") {
+    try {
+      player.nextVideo();
+      attemptedPlayerControl = true;
+    } catch (_) {}
+  } else if (nextButton?.isConnected &&
+      !nextButton.matches(":disabled, [aria-disabled='true'], .ytp-disabled")) {
+    try {
+      nextButton.click();
+      attemptedPlayerControl = true;
+    } catch (_) {}
+  }
+
+  if (nextId) {
+    const navigateIfStillCurrent = () => {
+      const urlId = new URL(window.location.href).searchParams.get("v");
+      const playerId = (document.getElementById("movie_player") as any)?.getVideoData?.()?.video_id;
+      if (urlId === currentId && (!playerId || playerId === currentId)) {
+        const target = new URL(currentUrl.href);
+        target.searchParams.set("v", nextId);
+        if (!target.searchParams.has("list")) {
+          target.search = `?v=${nextId}`;
+        }
+        window.location.assign(target.href);
+      }
+    };
+    if (attemptedPlayerControl) {
+      window.setTimeout(navigateIfStillCurrent, 650);
+    } else {
+      navigateIfStillCurrent();
+    }
+    return true;
+  }
+  return Boolean(nextButton?.isConnected &&
+    !nextButton.matches(":disabled, [aria-disabled='true'], .ytp-disabled"));
+}
+
+// Read chapters only when a popup asks for them. YouTube can keep its initial
+// data from an earlier video during in-page navigation, so verify the video ID
+// and fetch the current watch document if the in-page copy is stale.
+async function readYouTubeChaptersInPage(): Promise<{
+  videoId: string;
+  chapters: { title: string; startTime: number }[];
+}> {
+  const url = new URL(window.location.href);
+  const videoId = url.searchParams.get("v") || "";
+  if (url.pathname !== "/watch" || !/^[\w-]{11}$/.test(videoId)) {
+    return { videoId: "", chapters: [] };
+  }
+
+  const textOf = (value: any): string => {
+    if (typeof value === "string") return value.trim();
+    if (typeof value?.simpleText === "string") return value.simpleText.trim();
+    if (Array.isArray(value?.runs)) {
+      return value.runs.map((run: any) => run?.text || "").join("").trim();
+    }
+    return "";
+  };
+  const normalize = (rows: { title: unknown; startTime: unknown }[]) => {
+    const seen = new Set<number>();
+    return rows.map((row) => ({
+      title: textOf(row.title).slice(0, 200),
+      startTime: Number(row.startTime)
+    })).filter((row) => {
+      if (!row.title || !Number.isFinite(row.startTime) || row.startTime < 0 ||
+          row.startTime > 7 * 24 * 3600 || seen.has(row.startTime)) return false;
+      seen.add(row.startTime);
+      return true;
+    }).sort((a, b) => a.startTime - b.startTime).slice(0, 200);
+  };
+  const fromData = (data: any) => {
+    if (data?.currentVideoEndpoint?.watchEndpoint?.videoId !== videoId) return [];
+    const markers = data?.playerOverlays?.playerOverlayRenderer
+      ?.decoratedPlayerBarRenderer?.decoratedPlayerBarRenderer?.playerBar
+      ?.multiMarkersPlayerBarRenderer?.markersMap;
+    if (Array.isArray(markers)) {
+      for (const marker of markers) {
+        const chapters = marker?.value?.chapters;
+        if (Array.isArray(chapters) && chapters.length > 0) {
+          const rows = normalize(chapters.map((chapter: any) => ({
+            title: chapter?.chapterRenderer?.title,
+            startTime: Number(chapter?.chapterRenderer?.timeRangeStartMillis) / 1000
+          })));
+          if (rows.length > 0) return rows;
+        }
+      }
+    }
+    const panels = data?.engagementPanels;
+    if (Array.isArray(panels)) {
+      for (const panel of panels) {
+        const contents = panel?.engagementPanelSectionListRenderer?.content
+          ?.macroMarkersListRenderer?.contents;
+        if (!Array.isArray(contents)) continue;
+        const rows = normalize(contents.map((item: any) => ({
+          title: item?.macroMarkersListItemRenderer?.title,
+          startTime: item?.macroMarkersListItemRenderer?.onTap?.watchEndpoint?.startTimeSeconds
+        })));
+        if (rows.length > 0) return rows;
+      }
+    }
+    return [];
+  };
+
+  const current = fromData((window as any).ytInitialData);
+  if (current.length > 0) return { videoId, chapters: current };
+
+  const domItems = document.querySelectorAll("ytd-macro-markers-list-item-renderer");
+  if (domItems.length > 0) {
+    const domRows = normalize(Array.from(domItems, (item: any) => {
+      const data = item.data?.macroMarkersListItemRenderer || item.data;
+      const endpoint = data?.onTap?.watchEndpoint;
+      return {
+        title: endpoint?.videoId === videoId ? data?.title : "",
+        startTime: endpoint?.startTimeSeconds
+      };
+    }));
+    if (domRows.length > 0) return { videoId, chapters: domRows };
+  }
+
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), 7000);
+  try {
+    const response = await fetch(url.href, {
+      credentials: "include",
+      signal: controller.signal
+    });
+    if (!response.ok) return { videoId, chapters: [] };
+    const html = await response.text();
+    const marker = "var ytInitialData = ";
+    const index = html.indexOf(marker);
+    if (index < 0) return { videoId, chapters: [] };
+    const start = html.indexOf("{", index + marker.length);
+    if (start < 0) return { videoId, chapters: [] };
+    let depth = 0;
+    let quoted = false;
+    let escaped = false;
+    for (let i = start; i < html.length; i++) {
+      const char = html[i];
+      if (quoted) {
+        if (escaped) escaped = false;
+        else if (char === "\\") escaped = true;
+        else if (char === '"') quoted = false;
+      } else if (char === '"') {
+        quoted = true;
+      } else if (char === "{") {
+        depth++;
+      } else if (char === "}" && --depth === 0) {
+        const data = JSON.parse(html.slice(start, i + 1));
+        return { videoId, chapters: fromData(data) };
+      }
+    }
+  } catch (_) {
+    // The current page or its DOM may still provide chapters next time.
+  } finally {
+    window.clearTimeout(timeout);
+  }
+  return { videoId, chapters: [] };
+}
+
 function recordYouTubeNavigation(tabId: number, previousUrl?: string, nextUrl?: string) {
   if (!previousUrl || !nextUrl || previousUrl === nextUrl) return;
   const oldId = youtubeWatchVideoId(previousUrl);
@@ -59,6 +299,15 @@ function recordYouTubeNavigation(tabId: number, previousUrl?: string, nextUrl?: 
   } else if (!newId) {
     youtubeVideoHistory.delete(tabId);
     youtubeBackTargets.delete(tabId);
+  }
+}
+
+function updatePinnedUrl(tabId: number, previousUrl?: string, nextUrl?: string) {
+  if (!pinnedTabIds.has(tabId) || !previousUrl || !nextUrl || previousUrl === nextUrl) return;
+  const index = pinnedUrls.indexOf(previousUrl);
+  if (index >= 0) {
+    pinnedUrls[index] = nextUrl;
+    void browser.storage.local.set({ pinnedUrls }).catch(() => {});
   }
 }
 
@@ -105,6 +354,7 @@ async function persistState() {
       lastOrderedTabIds,
       customTabOrder,
       pinnedTabIds: Array.from(pinnedTabIds),
+      pinnedTabOrder,
       youtubeVideoHistory: Object.fromEntries(youtubeVideoHistory)
     });
   } catch (err) {
@@ -121,9 +371,10 @@ async function restoreState() {
         "lastOrderedTabIds",
         "customTabOrder",
         "pinnedTabIds",
+        "pinnedTabOrder",
         "youtubeVideoHistory"
       ]),
-      browser.storage.local.get(["customOrderUrls", "pinnedUrls"])
+      browser.storage.local.get(["customOrderUrls", "pinnedUrls", "pinnedOrderMigrated"])
     ]);
 
     if (data.registry && typeof data.registry === "object") {
@@ -162,6 +413,14 @@ async function restoreState() {
         if (typeof tabId === "number") pinnedTabIds.add(tabId);
       }
     }
+    if (Array.isArray(data.pinnedTabOrder)) {
+      pinnedTabOrder = data.pinnedTabOrder.filter(
+        (tabId: unknown): tabId is number => typeof tabId === "number" && pinnedTabIds.has(tabId)
+      );
+    } else {
+      // Preserve pin order from builds that only saved the full card order.
+      pinnedTabOrder = customTabOrder.filter((tabId) => pinnedTabIds.has(tabId));
+    }
     if (data.youtubeVideoHistory && typeof data.youtubeVideoHistory === "object") {
       for (const [tabId, urls] of Object.entries(data.youtubeVideoHistory as Record<string, unknown>)) {
         if (Array.isArray(urls)) {
@@ -175,16 +434,23 @@ async function restoreState() {
       pinnedUrls = savedOrder.pinnedUrls.filter(
         (url: unknown): url is string => typeof url === "string" && url.length > 0
       );
+      if (savedOrder.pinnedOrderMigrated !== true && customOrderUrls.length > 0) {
+        const remaining = [...pinnedUrls];
+        const ordered: string[] = [];
+        for (const url of customOrderUrls) {
+          const index = remaining.indexOf(url);
+          if (index >= 0) ordered.push(...remaining.splice(index, 1));
+        }
+        pinnedUrls = [...ordered, ...remaining];
+        await browser.storage.local.set({ pinnedUrls, pinnedOrderMigrated: true });
+      }
     }
   } catch (err) {
     console.warn("[MediaControls Background] Failed to restore state:", err);
   }
 }
 
-const RETENTION_MS = 60 * 60 * 1000; // 60 minutes
-
 function resolveSessions(): Session[] {
-  const now = Date.now();
   const sessionsMap = new Map<number, Session>();
 
   // 1. Resolve tabs with reported frame state
@@ -245,16 +511,6 @@ function resolveSessions(): Session[] {
       chosenFrameId = candidate.frameId;
       chosenState = candidate.state;
 
-      // Retention check: if paused, retain up to 60 mins
-      if (
-        chosenState.playbackState === "paused" &&
-        now - chosenState.lastPlayedAt > RETENTION_MS
-      ) {
-        // Expired
-        frameMap.delete(chosenFrameId);
-        continue;
-      }
-
       const isYt =
         (tab?.url && (tab.url.includes("youtube.com") || tab.url.includes("youtu.be"))) ||
         chosenState.metadata?.album === "YouTube";
@@ -280,6 +536,9 @@ function resolveSessions(): Session[] {
               : chosenState.actions.filter((action) => action !== "previoustrack")
           }
         : chosenState;
+      const sessionState = isYouTubeVideoWatchUrl(tab?.url) && !state.actions.includes("nexttrack")
+        ? { ...state, actions: [...state.actions, "nexttrack" as const] }
+        : state;
 
       sessionsMap.set(tabId, {
         tabId,
@@ -287,11 +546,13 @@ function resolveSessions(): Session[] {
         hostname: getHostname(tab?.url),
         favIconUrl: tab?.favIconUrl || "",
         tabTitle: tab?.title || chosenState.metadata?.title || "Audio",
-        state,
+        state: sessionState,
         audible: Boolean(tab?.audible),
         muted: Boolean(tab?.muted),
         degraded: false,
-        pinned: false
+        pinned: false,
+        youtubeVideoId: isYouTubeVideoWatchUrl(tab?.url)
+          ? youtubeWatchVideoId(tab?.url) || undefined : undefined
       });
     }
   }
@@ -341,8 +602,32 @@ function resolveSessions(): Session[] {
   }
 
   const pinnedFirst = (ordered: Session[]): Session[] => {
+    const pinned = ordered.filter((session) => session.pinned);
+    const remaining = new Map(pinned.map((session) => [session.tabId, session]));
+    const orderedPinned: Session[] = [];
+    for (const url of pinnedUrls) {
+      const candidates = Array.from(remaining.values()).filter(
+        (candidate) => tabsInfo.get(candidate.tabId)?.url === url
+      );
+      const session = pinnedTabOrder
+        .map((tabId) => remaining.get(tabId))
+        .find((candidate) => candidate && tabsInfo.get(candidate.tabId)?.url === url) ||
+        candidates[0];
+      if (session) {
+        orderedPinned.push(session);
+        remaining.delete(session.tabId);
+      }
+    }
+    for (const tabId of pinnedTabOrder) {
+      const session = remaining.get(tabId);
+      if (session) {
+        orderedPinned.push(session);
+        remaining.delete(tabId);
+      }
+    }
     const result = [
-      ...ordered.filter((session) => session.pinned),
+      ...orderedPinned,
+      ...remaining.values(),
       ...ordered.filter((session) => !session.pinned)
     ];
     lastOrderedTabIds = result.map((session) => session.tabId);
@@ -521,6 +806,7 @@ async function refreshTabsAndInject() {
     for (const tabId of pinnedTabIds) {
       if (!currentOpenIds.has(tabId)) pinnedTabIds.delete(tabId);
     }
+    pinnedTabOrder = pinnedTabOrder.filter((id) => currentOpenIds.has(id));
 
     for (const tab of tabs) {
       if (!tab.id) continue;
@@ -534,6 +820,7 @@ async function refreshTabsAndInject() {
       };
 
       recordYouTubeNavigation(tab.id, current.url, tab.url);
+      updatePinnedUrl(tab.id, current.url, tab.url);
 
       tabsInfo.set(tab.id, {
         audible: Boolean(tab.audible),
@@ -601,6 +888,7 @@ browser.runtime.onMessage.addListener(
           url: ""
         };
         recordYouTubeNavigation(tabId, current.url, sender.tab.url);
+        updatePinnedUrl(tabId, current.url, sender.tab.url);
         tabsInfo.set(tabId, {
           ...current,
           audible: sender.tab.audible ?? current.audible,
@@ -637,6 +925,7 @@ browser.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
   const newUrl = changeInfo.url || tab.url;
   const prevUrl = tabsInfo.get(tabId)?.url;
   recordYouTubeNavigation(tabId, prevUrl, newUrl);
+  updatePinnedUrl(tabId, prevUrl, newUrl);
   if (prevUrl && newUrl && prevUrl !== newUrl) {
     try {
       const oldU = new URL(prevUrl);
@@ -657,14 +946,6 @@ browser.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
     favIconUrl: "",
     url: ""
   };
-
-  if (pinnedTabIds.has(tabId) && prevUrl && newUrl && prevUrl !== newUrl) {
-    const urlIndex = pinnedUrls.indexOf(prevUrl);
-    if (urlIndex >= 0) {
-      pinnedUrls[urlIndex] = newUrl;
-      browser.storage.local.set({ pinnedUrls }).catch(() => {});
-    }
-  }
 
   const isAudible = changeInfo.audible ?? tab.audible ?? current.audible;
   tabsInfo.set(tabId, {
@@ -701,6 +982,7 @@ browser.tabs.onRemoved.addListener(async (tabId) => {
   lastOrderedTabIds = lastOrderedTabIds.filter((id) => id !== tabId);
   customTabOrder = customTabOrder.filter((id) => id !== tabId);
   pinnedTabIds.delete(tabId);
+  pinnedTabOrder = pinnedTabOrder.filter((id) => id !== tabId);
   youtubeVideoHistory.delete(tabId);
   youtubeBackTargets.delete(tabId);
   persistState();
@@ -728,6 +1010,21 @@ browser.runtime.onConnect.addListener((port) => {
       await readyPromise;
       const msg = rawMsg as PopupToBgMessage;
       if (msg.type === "cmd") {
+        if (msg.cmd.action === "nexttrack") {
+          try {
+            const tab = await browser.tabs.get(msg.tabId);
+            if (isYouTubeVideoWatchUrl(tab.url)) {
+              const result = await browser.scripting.executeScript({
+                target: { tabId: msg.tabId, frameIds: [0] },
+                world: "MAIN" as any,
+                func: advanceYouTubeVideoInPage as () => void
+              });
+              if (result[0]?.result === true) return;
+            }
+          } catch (err) {
+            console.warn("[MediaControls Background] YouTube Next command failed:", err);
+          }
+        }
         if (msg.cmd.action === "previoustrack") {
           const currentUrl = tabsInfo.get(msg.tabId)?.url;
           const history = youtubeVideoHistory.get(msg.tabId);
@@ -812,35 +1109,75 @@ browser.runtime.onConnect.addListener((port) => {
       } else if (msg.type === "reorder") {
         lastOrderedTabIds = msg.tabIds;
         customTabOrder = msg.tabIds;
+        pinnedTabOrder = msg.tabIds.filter((tabId) => pinnedTabIds.has(tabId));
+        const reorderedPinnedUrls = pinnedTabOrder
+          .map((tabId) => tabsInfo.get(tabId)?.url || "")
+          .filter((url) => url.length > 0);
+        const absentPinnedUrls = [...pinnedUrls];
+        for (const url of reorderedPinnedUrls) {
+          const index = absentPinnedUrls.indexOf(url);
+          if (index >= 0) absentPinnedUrls.splice(index, 1);
+        }
+        pinnedUrls = [...reorderedPinnedUrls, ...absentPinnedUrls];
         customOrderUrls = msg.tabIds
           .map((tabId) => tabsInfo.get(tabId)?.url || "")
           .filter((url) => url.length > 0);
         try {
-          await browser.storage.local.set({ customOrderUrls });
+          await browser.storage.local.set({ customOrderUrls, pinnedUrls, pinnedOrderMigrated: true });
         } catch (err) {
           console.warn("[MediaControls Background] Failed to save card order:", err);
         }
-        persistState();
+        await persistState();
         broadcastSessions();
       } else if (msg.type === "pin") {
         const url = tabsInfo.get(msg.tabId)?.url || "";
         if (msg.pinned) {
           if (!pinnedTabIds.has(msg.tabId)) {
             pinnedTabIds.add(msg.tabId);
+            pinnedTabOrder.push(msg.tabId);
             if (url) pinnedUrls.push(url);
           }
         } else {
           pinnedTabIds.delete(msg.tabId);
+          pinnedTabOrder = pinnedTabOrder.filter((id) => id !== msg.tabId);
           const urlIndex = pinnedUrls.indexOf(url);
           if (urlIndex >= 0) pinnedUrls.splice(urlIndex, 1);
         }
-        void persistState();
-        broadcastSessions();
         try {
-          await browser.storage.local.set({ pinnedUrls });
+          await browser.storage.local.set({ pinnedUrls, pinnedOrderMigrated: true });
         } catch (err) {
           console.warn("[MediaControls Background] Failed to save pinned cards:", err);
         }
+        await persistState();
+        broadcastSessions();
+      } else if (msg.type === "chapters-request") {
+        let videoId = youtubeWatchVideoId(tabsInfo.get(msg.tabId)?.url) || "";
+        let chapters: YouTubeChapter[] = [];
+        try {
+          const tab = await browser.tabs.get(msg.tabId);
+          if (isYouTubeVideoWatchUrl(tab.url)) {
+            videoId = youtubeWatchVideoId(tab.url) || "";
+            const result = await browser.scripting.executeScript({
+              target: { tabId: msg.tabId, frameIds: [0] },
+              world: "MAIN" as any,
+              func: readYouTubeChaptersInPage as () => void
+            });
+            const page = result[0]?.result as { videoId?: unknown; chapters?: unknown } | undefined;
+            if (page?.videoId === videoId && Array.isArray(page.chapters)) {
+              chapters = page.chapters.filter((chapter: any): chapter is YouTubeChapter =>
+                typeof chapter?.title === "string" && chapter.title.trim().length > 0 &&
+                chapter.title.length <= 200 && typeof chapter.startTime === "number" &&
+                Number.isFinite(chapter.startTime) && chapter.startTime >= 0 &&
+                chapter.startTime <= 7 * 24 * 3600
+              ).slice(0, 200);
+            }
+          }
+        } catch (err) {
+          console.warn("[MediaControls Background] Could not read YouTube chapters:", err);
+        }
+        try {
+          port.postMessage({ type: "chapters", tabId: msg.tabId, videoId, chapters } as BgToPopupMessage);
+        } catch (_) {}
       } else if (msg.type === "request-sessions") {
         await refreshTabsAndInject();
         port.postMessage({
@@ -854,7 +1191,7 @@ browser.runtime.onConnect.addListener((port) => {
       connectedPopupPorts.delete(port);
       // Clean up stable ordering on popup close
       lastOrderedTabIds = [];
-      persistState();
+      void browser.storage.session.set({ lastOrderedTabIds: [] }).catch(() => {});
     });
   }
 });

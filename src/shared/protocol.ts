@@ -57,6 +57,12 @@ export interface Session {
   muted: boolean;
   degraded: boolean;
   pinned: boolean;
+  youtubeVideoId?: string;
+}
+
+export interface YouTubeChapter {
+  title: string;
+  startTime: number;
 }
 
 // MAIN -> relay: { __mcx: "up", state: FrameState | null }
@@ -87,10 +93,10 @@ export type PopupToBgMessage =
   | { type: "mute"; tabId: number; muted: boolean }
   | { type: "reorder"; tabIds: number[] }
   | { type: "pin"; tabId: number; pinned: boolean }
+  | { type: "chapters-request"; tabId: number }
   | { type: "request-sessions" };
 
 // bg -> popup (via port):
-export interface BgToPopupMessage {
-  type: "sessions";
-  sessions: Session[];
-}
+export type BgToPopupMessage =
+  | { type: "sessions"; sessions: Session[] }
+  | { type: "chapters"; tabId: number; videoId: string; chapters: YouTubeChapter[] };

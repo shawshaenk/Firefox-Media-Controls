@@ -8,15 +8,16 @@ Media Controls brings a Chrome-style global media controls flyout to Firefox. Op
 - **Broad media detection.** Detects audio and video elements, including media in frames and shadow DOM, detached `new Audio()` elements, Media Session metadata and actions, and Web Audio contexts.
 - **Playback controls.** Play and pause media, and use previous or next when the site provides those actions. YouTube playlist position and available player controls are used to decide when track controls are available.
 - **Seeking.** Drag the progress bar to seek or skip backward and forward by 10 seconds. Seeking controls are hidden for live or non-seekable media and disabled when playback is blocked.
+- **YouTube chapters.** Open the chapter menu on a YouTube video card to jump to a chapter. The list scrolls within the card.
 - **Autoplay feedback.** Firefox's autoplay policy still applies. If Firefox blocks extension playback, the Play button and seek skip buttons are disabled until playback is started from the page.
 - **Fallback for restricted tabs.** When Firefox reports a tab as audible but the extension cannot access its page, a simplified card lets you mute or unmute that tab.
-- **Pin and reorder cards.** Pin important cards to keep them above the rest, then drag cards to arrange their order. Pinning and custom order are saved across browser restarts.
+- **Pin and reorder cards.** Pin important cards to keep them above the rest, then drag cards to arrange their order. The order of pinned cards is saved across flyout and browser restarts.
 - **Tab count badge.** The toolbar badge shows how many cards are being tracked, including paused sessions; it is not limited to tabs currently producing sound.
 - **Light and dark themes.** The flyout follows the browser's color scheme.
 - **Keyboard access.** Use the slider's arrow, Home, and End keys to seek. Use the card's drag handle or Alt/Ctrl + Up/Down to reorder cards.
 - **Quick access.** Open the flyout with `Alt+Shift+M` or click the extension's toolbar button.
 
-Paused sessions stay in the flyout for up to 60 minutes, so you can resume playback without finding the tab again. They are removed when their tab closes or navigates. Click the non-control area of a card to focus its tab. When there are no cards, the flyout shows a “No media is playing” message.
+Paused sessions stay in the flyout while their media remains available to control. They are removed when their tab closes or navigates away from the media. Click the non-control area of a card to focus its tab. When there are no cards, the flyout shows a “No media is playing” message.
 
 ## Compatibility and permissions
 
@@ -35,7 +36,7 @@ Build the XPI, then load it as a temporary add-on:
 2. Run `npm install` in this repository.
 3. Run `npm run package`.
 4. In Firefox, open `about:debugging#/runtime/this-firefox`.
-5. Choose **Load Temporary Add-on** and select `dist/media-controls-1.0.10.xpi`.
+5. Choose **Load Temporary Add-on** and select `dist/media-controls-1.0.12.xpi`.
 
 Temporary add-ons must be loaded again after restarting Firefox. This locally built XPI is not signed for permanent installation from the Add-ons Manager.
 
@@ -44,7 +45,7 @@ Temporary add-ons must be loaded again after restarting Firefox. This locally bu
 ```sh
 npm install
 npm run build       # Bundle the extension scripts
-npm run package     # Build and create dist/media-controls-1.0.10.xpi
+npm run package     # Build and create dist/media-controls-1.0.12.xpi
 npm run typecheck   # Check TypeScript types
 npm run lint        # Run web-ext lint
 ```

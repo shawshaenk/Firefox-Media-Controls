@@ -2,6 +2,7 @@
 (() => {
   // src/popup/icons.ts
   var ICON_PATHS = {
+    expand_more: "M480-383q-7 0-13-2.5t-11-7.5L272-577q-11-11-11-28t11-28q11-11 28-11t28 11l152 152 152-152q11-11 28-11t28 11q11 11 11 28t-11 28L504-393q-5 5-11 7.5t-13 2.5Z",
     push_pin: "M16 9V4h1c.55 0 1-.45 1-1s-.45-1-1-1H7c-.55 0-1 .45-1 1s.45 1 1 1h1v5c0 1.66-1.34 3-3 3v2h6v7l1 1 1-1v-7h6v-2c-1.66 0-3-1.34-3-3Z",
     drag_indicator: "M360-160q-33 0-56.5-23.5T280-240q0-33 23.5-56.5T360-320q33 0 56.5 23.5T440-240q0 33-23.5 56.5T360-160Zm240 0q-33 0-56.5-23.5T520-240q0-33 23.5-56.5T600-320q33 0 56.5 23.5T680-240q0 33-23.5 56.5T600-160ZM360-400q-33 0-56.5-23.5T280-480q0-33 23.5-56.5T360-560q33 0 56.5 23.5T440-480q0 33-23.5 56.5T360-400Zm240 0q-33 0-56.5-23.5T520-480q0-33 23.5-56.5T600-560q33 0 56.5 23.5T680-480q0 33-23.5 56.5T600-400ZM360-640q-33 0-56.5-23.5T280-720q0-33 23.5-56.5T360-800q33 0 56.5 23.5T440-720q0 33-23.5 56.5T360-640Zm240 0q-33 0-56.5-23.5T520-720q0-33 23.5-56.5T600-800q33 0 56.5 23.5T680-720q0 33-23.5 56.5T600-640Z",
     skip_previous: "M220-280v-400q0-17 11.5-28.5T260-720q17 0 28.5 11.5T300-680v400q0 17-11.5 28.5T260-240q-17 0-28.5-11.5T220-280Zm458-1L430-447q-9-6-13.5-14.5T412-480q0-10 4.5-18.5T430-513l248-166q5-4 11-5t11-1q16 0 28 11t12 29v330q0 18-12 29t-28 11q-5 0-11-1t-11-5Z",
@@ -69,8 +70,13 @@
   function formatTime(sec) {
     if (isNaN(sec) || !isFinite(sec) || sec < 0) return "0:00";
     const total = Math.floor(sec);
+    const h = Math.floor(total / 3600);
     const m = Math.floor(total / 60);
     const s = total % 60;
+    if (h > 0) {
+      const minutes = m % 60;
+      return `${h}:${minutes < 10 ? "0" : ""}${minutes}:${s < 10 ? "0" : ""}${s}`;
+    }
     return `${m}:${s < 10 ? "0" : ""}${s}`;
   }
   function parseSize(sizeStr) {
@@ -203,6 +209,20 @@
     cardEl.focus();
   }
   var activeDragSession = null;
+  function dragTargetIndex(session, deltaY) {
+    const center = session.cardCenters[session.initialIndex] + deltaY;
+    let target = session.initialIndex;
+    if (deltaY > 0) {
+      for (let i = session.initialIndex + 1; i < session.cards.length; i++) {
+        if (center >= session.cardCenters[i]) target = i;
+      }
+    } else {
+      for (let i = session.initialIndex - 1; i >= 0; i--) {
+        if (center <= session.cardCenters[i]) target = i;
+      }
+    }
+    return target;
+  }
   function setupCardDrag(dragHandle, cardEl, tabId) {
     dragHandle.addEventListener("pointerdown", (e) => {
       if (e.button !== 0) return;
@@ -220,6 +240,10 @@
         initialIndex,
         cardHeight: rect.height,
         cards: allCards,
+        cardCenters: allCards.map((card) => {
+          const bounds = card.getBoundingClientRect();
+          return bounds.top + bounds.height / 2;
+        }),
         hasMovedPastThreshold: false,
         pointerId: e.pointerId
       };
@@ -249,11 +273,7 @@
       }
       const GAP = 8;
       const slotHeight = activeDragSession.cardHeight + GAP;
-      const offset = Math.round(deltaY / slotHeight);
-      const targetIndex = Math.max(
-        0,
-        Math.min(activeDragSession.cards.length - 1, activeDragSession.initialIndex + offset)
-      );
+      const targetIndex = dragTargetIndex(activeDragSession, deltaY);
       for (let k = 0; k < activeDragSession.cards.length; k++) {
         if (k === activeDragSession.initialIndex) continue;
         const otherCard = activeDragSession.cards[k];
@@ -286,13 +306,7 @@
         return;
       }
       const deltaY = e.clientY - session.startY;
-      const GAP = 8;
-      const slotHeight = session.cardHeight + GAP;
-      const offset = Math.round(deltaY / slotHeight);
-      const targetIndex = Math.max(
-        0,
-        Math.min(session.cards.length - 1, session.initialIndex + offset)
-      );
+      const targetIndex = dragTargetIndex(session, deltaY);
       for (const c of session.cards) {
         c.style.transform = "";
       }
@@ -320,7 +334,7 @@
     cardEl.dataset.tabId = String(session.tabId);
     cardEl.addEventListener("click", (e) => {
       const target = e.target;
-      if (target.closest("button") || target.closest(".slider-container") || target.closest(".card-drag-handle")) {
+      if (target.closest("button") || target.closest(".slider-container") || target.closest(".chapter-section") || target.closest(".card-drag-handle")) {
         return;
       }
       sendFocus(cardDom.session.tabId);
@@ -360,6 +374,25 @@
       }
     });
     setupCardDrag(dragHandle, cardEl, session.tabId);
+    const chapterBtn = document.createElement("button");
+    chapterBtn.className = "card-chapters-btn";
+    chapterBtn.type = "button";
+    chapterBtn.setAttribute("aria-label", "Show video chapters");
+    chapterBtn.setAttribute("aria-expanded", "false");
+    chapterBtn.title = "Show video chapters";
+    setIcon(chapterBtn, "expand_more");
+    chapterBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const videoId = cardDom.session.youtubeVideoId;
+      if (!videoId) return;
+      setChaptersOpen(cardDom, !cardDom.chaptersOpen);
+      if (cardDom.chaptersOpen) {
+        if (cardDom.chapterVideoId !== videoId) {
+          showChapterMessage(cardDom, "Loading chapters\u2026");
+        }
+        port?.postMessage({ type: "chapters-request", tabId: cardDom.session.tabId });
+      }
+    });
     const pinBtn = document.createElement("button");
     pinBtn.className = "card-pin-btn";
     pinBtn.type = "button";
@@ -580,10 +613,26 @@
     bottomRowEl.addEventListener("mousedown", (e) => {
       e.stopPropagation();
     });
+    const chapterSection = document.createElement("section");
+    chapterSection.className = "chapter-section";
+    chapterSection.hidden = true;
+    chapterSection.id = `chapters-${session.tabId}`;
+    chapterBtn.setAttribute("aria-controls", chapterSection.id);
+    const chapterHeading = document.createElement("div");
+    chapterHeading.className = "chapter-heading";
+    chapterHeading.textContent = "Chapters";
+    const chapterList = document.createElement("div");
+    chapterList.className = "chapter-list";
+    chapterList.setAttribute("role", "group");
+    chapterList.setAttribute("aria-label", "Video chapters");
+    chapterSection.appendChild(chapterHeading);
+    chapterSection.appendChild(chapterList);
+    cardEl.appendChild(chapterBtn);
     cardEl.appendChild(pinBtn);
     cardEl.appendChild(dragHandle);
     cardEl.appendChild(topRowEl);
     cardEl.appendChild(bottomRowEl);
+    cardEl.appendChild(chapterSection);
     const cardDom = {
       cardEl,
       topRowEl,
@@ -606,6 +655,13 @@
       nextBtn,
       dragHandle,
       pinBtn,
+      chapterBtn,
+      chapterSection,
+      chapterList,
+      chapterVideoId: null,
+      chapters: [],
+      chaptersOpen: false,
+      activeChapterIndex: -1,
       session,
       isDragging: false,
       dragPct: 0,
@@ -614,6 +670,75 @@
       pendingSeek: null
     };
     return cardDom;
+  }
+  function setChaptersOpen(card, open) {
+    card.chaptersOpen = open;
+    card.chapterSection.hidden = !open;
+    card.chapterBtn.classList.toggle("is-open", open);
+    card.chapterBtn.setAttribute("aria-expanded", String(open));
+    card.chapterBtn.setAttribute("aria-label", open ? "Hide video chapters" : "Show video chapters");
+    card.chapterBtn.title = open ? "Hide video chapters" : "Show video chapters";
+  }
+  function showChapterMessage(card, text) {
+    const message = document.createElement("div");
+    message.className = "chapter-message";
+    message.textContent = text;
+    card.chapterList.replaceChildren(message);
+  }
+  function updateActiveChapter(card) {
+    if (!card.chaptersOpen || card.chapters.length === 0) return;
+    const position = card.pendingSeek?.position ?? card.lastInterpolatedPos;
+    let activeIndex = -1;
+    for (let i = 0; i < card.chapters.length; i++) {
+      if (card.chapters[i].startTime <= position + 0.5) activeIndex = i;
+      else break;
+    }
+    if (activeIndex === card.activeChapterIndex) return;
+    card.activeChapterIndex = activeIndex;
+    const rows = card.chapterList.querySelectorAll(".chapter-row");
+    rows.forEach((row, index) => {
+      row.classList.toggle("is-current", index === activeIndex);
+      if (index === activeIndex) row.setAttribute("aria-current", "true");
+      else row.removeAttribute("aria-current");
+    });
+  }
+  function renderChapters(card, videoId, chapters) {
+    card.chapterVideoId = videoId;
+    card.chapters = chapters;
+    card.activeChapterIndex = -1;
+    if (chapters.length === 0) {
+      showChapterMessage(card, "No chapters available for this video");
+      return;
+    }
+    const rows = chapters.map((chapter) => {
+      const row = document.createElement("button");
+      row.className = "chapter-row";
+      row.type = "button";
+      row.setAttribute("aria-label", `Seek to ${chapter.title} at ${formatTime(chapter.startTime)}`);
+      const title = document.createElement("span");
+      title.className = "chapter-title";
+      title.textContent = chapter.title;
+      const time = document.createElement("span");
+      time.className = "chapter-time";
+      time.textContent = formatTime(chapter.startTime);
+      row.append(title, time);
+      row.addEventListener("click", (event) => {
+        event.stopPropagation();
+        if (card.session.youtubeVideoId !== videoId) return;
+        const duration = card.session.state?.position?.duration;
+        const seekTime = duration && Number.isFinite(duration) ? Math.min(chapter.startTime, duration) : chapter.startTime;
+        if (duration && Number.isFinite(duration) && duration > 0) {
+          commitSeekPosition(card, seekTime, duration, 0);
+        } else {
+          sendCommand(card.session.tabId, 0, { action: "seekto", seekTime });
+          card.lastInterpolatedPos = seekTime;
+        }
+        updateActiveChapter(card);
+      });
+      return row;
+    });
+    card.chapterList.replaceChildren(...rows);
+    updateActiveChapter(card);
   }
   function updatePlayButton(card) {
     const session = card.session;
@@ -645,6 +770,7 @@
   }
   function applySliderPosition(card, pos, duration) {
     card.lastInterpolatedPos = pos;
+    updateActiveChapter(card);
     if (duration <= 0 || !isFinite(duration)) {
       card.activeTrack.style.width = "0px";
       card.inactiveTrack.style.width = "100%";
@@ -669,7 +795,7 @@
       `${formatTime(pos)} / ${formatTime(duration)}`
     );
   }
-  function commitSeekPosition(card, position, duration) {
+  function commitSeekPosition(card, position, duration, frameId = card.session.frameId) {
     const now = Date.now();
     card.pendingSeek = {
       position,
@@ -679,12 +805,19 @@
       expiresAt: now + 4e3
     };
     applySliderPosition(card, position, duration);
-    sendCommand(card.session.tabId, card.session.frameId, {
+    sendCommand(card.session.tabId, frameId, {
       action: "seekto",
       seekTime: position
     });
   }
   function updateCardDom(card, session) {
+    if (session.youtubeVideoId !== card.session.youtubeVideoId) {
+      setChaptersOpen(card, false);
+      card.chapterVideoId = null;
+      card.chapters = [];
+      card.activeChapterIndex = -1;
+      card.chapterList.replaceChildren();
+    }
     if (card.pendingPlayback && (session.frameId !== card.session.frameId || session.degraded || session.state?.playBlocked && card.pendingPlayback.state === "playing" || session.state?.playbackState === card.pendingPlayback.state)) {
       card.pendingPlayback = null;
     }
@@ -702,6 +835,8 @@
     card.pinBtn.setAttribute("aria-pressed", String(session.pinned));
     card.pinBtn.setAttribute("aria-label", session.pinned ? "Unpin card" : "Pin card to top");
     card.pinBtn.title = session.pinned ? "Unpin card" : "Pin card to top";
+    card.chapterBtn.hidden = !session.youtubeVideoId || session.degraded;
+    if (card.chapterBtn.hidden && card.chaptersOpen) setChaptersOpen(card, false);
     const hostname = session.hostname || "browser";
     card.sourceHostname.textContent = hostname;
     if (session.favIconUrl) {
@@ -978,6 +1113,11 @@
             currentSessions = msg.sessions;
             updateSessionsView(currentSessions);
             if (currentSessions.length === 0) void showAudibleFallback();
+          } else if (msg.type === "chapters") {
+            const card = renderedCards.get(msg.tabId);
+            if (card?.chaptersOpen && card.session.youtubeVideoId === msg.videoId) {
+              renderChapters(card, msg.videoId, msg.chapters);
+            }
           }
         });
         connection.onDisconnect.addListener(() => {
@@ -986,6 +1126,11 @@
           setTimeout(connectPopup, 500);
         });
         connection.postMessage({ type: "request-sessions" });
+        for (const card of renderedCards.values()) {
+          if (card.chaptersOpen && card.session.youtubeVideoId) {
+            connection.postMessage({ type: "chapters-request", tabId: card.session.tabId });
+          }
+        }
       } catch (err) {
         console.error("[MediaControls Popup] Cannot connect to background:", err);
         setTimeout(connectPopup, 500);

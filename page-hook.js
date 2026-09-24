@@ -885,18 +885,36 @@
       try {
         const currentId = getYouTubeVideoId();
         if (!currentId || window.location.pathname !== "/watch") return null;
+        const idFromHref = (href) => {
+          if (!href) return null;
+          const url = new URL(href, window.location.href);
+          const id = url.searchParams.get("v");
+          return /(^|\.)youtube\.com$/.test(url.hostname) && url.pathname === "/watch" && id && /^[\w-]{11}$/.test(id) && id !== currentId ? id : null;
+        };
         const data = window.ytInitialData;
         const dataCurrentId = data?.currentVideoEndpoint?.watchEndpoint?.videoId;
-        if (dataCurrentId && dataCurrentId !== currentId) return null;
         const nextHref = document.querySelector("a.ytp-next-button[href]")?.href;
-        if (nextHref) {
-          const nextUrl = new URL(nextHref, window.location.href);
-          const linkId = /(^|\.)youtube\.com$/.test(nextUrl.hostname) && nextUrl.pathname === "/watch" ? nextUrl.searchParams.get("v") : null;
-          if (linkId && /^[\w-]{11}$/.test(linkId) && linkId !== currentId) return linkId;
+        const linkId = idFromHref(nextHref ?? null);
+        if (linkId) return linkId;
+        if (!dataCurrentId || dataCurrentId === currentId) {
+          const sets = data?.contents?.twoColumnWatchNextResults?.autoplay?.autoplay?.sets;
+          if (Array.isArray(sets)) {
+            for (const set of sets) {
+              const nextId = set?.autoplayVideo?.watchEndpoint?.videoId;
+              if (typeof nextId === "string" && /^[\w-]{11}$/.test(nextId) && nextId !== currentId) {
+                return nextId;
+              }
+            }
+          }
         }
-        const sets = data?.contents?.twoColumnWatchNextResults?.autoplay?.autoplay?.sets;
-        const nextId = sets?.[0]?.autoplayVideo?.watchEndpoint?.videoId;
-        return typeof nextId === "string" && /^[\w-]{11}$/.test(nextId) && nextId !== currentId ? nextId : null;
+        const recommendations = document.querySelectorAll(
+          "#secondary a[href*='/watch?'], #related a[href*='/watch?']"
+        );
+        for (const link of recommendations) {
+          const id = idFromHref(link.getAttribute("href"));
+          if (id) return id;
+        }
+        return null;
       } catch (_) {
         return null;
       }

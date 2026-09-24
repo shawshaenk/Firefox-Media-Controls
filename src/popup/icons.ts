@@ -8,9 +8,12 @@ export type IconName =
   | "volume_up"
   | "volume_off"
   | "push_pin"
+  | "expand_more"
   | "drag_indicator";
 
 export const ICON_PATHS: Record<IconName, string> = {
+  expand_more:
+    "M480-383q-7 0-13-2.5t-11-7.5L272-577q-11-11-11-28t11-28q11-11 28-11t28 11l152 152 152-152q11-11 28-11t28 11q11 11 11 28t-11 28L504-393q-5 5-11 7.5t-13 2.5Z",
   push_pin:
     "M16 9V4h1c.55 0 1-.45 1-1s-.45-1-1-1H7c-.55 0-1 .45-1 1s.45 1 1 1h1v5c0 1.66-1.34 3-3 3v2h6v7l1 1 1-1v-7h6v-2c-1.66 0-3-1.34-3-3Z",
   drag_indicator:
