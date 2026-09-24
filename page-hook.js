@@ -866,6 +866,7 @@
       return { found: false, button: null, disabled: false };
     }
     function isTrackActionAvailable(action) {
+      if (action === "nexttrack" && getYouTubeSuggestedNextVideoId()) return true;
       const playlist = getYouTubePlaylistPosition();
       if (action === "previoustrack" && playlist && playlist.index === 0) {
         return false;
@@ -879,6 +880,26 @@
         return Boolean(control.button);
       }
       return Boolean(control.button || !control.disabled && handlers[action]);
+    }
+    function getYouTubeSuggestedNextVideoId() {
+      try {
+        const currentId = getYouTubeVideoId();
+        if (!currentId || window.location.pathname !== "/watch") return null;
+        const data = window.ytInitialData;
+        const dataCurrentId = data?.currentVideoEndpoint?.watchEndpoint?.videoId;
+        if (dataCurrentId && dataCurrentId !== currentId) return null;
+        const nextHref = document.querySelector("a.ytp-next-button[href]")?.href;
+        if (nextHref) {
+          const nextUrl = new URL(nextHref, window.location.href);
+          const linkId = /(^|\.)youtube\.com$/.test(nextUrl.hostname) && nextUrl.pathname === "/watch" ? nextUrl.searchParams.get("v") : null;
+          if (linkId && /^[\w-]{11}$/.test(linkId) && linkId !== currentId) return linkId;
+        }
+        const sets = data?.contents?.twoColumnWatchNextResults?.autoplay?.autoplay?.sets;
+        const nextId = sets?.[0]?.autoplayVideo?.watchEndpoint?.videoId;
+        return typeof nextId === "string" && /^[\w-]{11}$/.test(nextId) && nextId !== currentId ? nextId : null;
+      } catch (_) {
+        return null;
+      }
     }
     function getYouTubePlaylistPosition() {
       try {
@@ -945,6 +966,17 @@
           }
         } catch (_) {
         }
+      }
+      const suggestedId = getYouTubeSuggestedNextVideoId();
+      if (suggestedId) {
+        const currentId = getYouTubeVideoId();
+        if (control.button) control.button.click();
+        window.setTimeout(() => {
+          if (getYouTubeVideoId() === currentId) {
+            window.location.assign(`/watch?v=${suggestedId}`);
+          }
+        }, control.button ? 600 : 0);
+        return true;
       }
       if (control.disabled) return false;
       if (window.location.hostname.includes("youtube.com") && control.button) {

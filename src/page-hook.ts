@@ -1110,6 +1110,7 @@ import type {
   }
 
   function isTrackActionAvailable(action: "previoustrack" | "nexttrack"): boolean {
+    if (action === "nexttrack" && getYouTubeSuggestedNextVideoId()) return true;
     const playlist = getYouTubePlaylistPosition();
     if (action === "previoustrack" && playlist && playlist.index === 0) {
       return false;
@@ -1127,6 +1128,30 @@ import type {
       return Boolean(control.button);
     }
     return Boolean(control.button || (!control.disabled && handlers[action]));
+  }
+
+  function getYouTubeSuggestedNextVideoId(): string | null {
+    try {
+      const currentId = getYouTubeVideoId();
+      if (!currentId || window.location.pathname !== "/watch") return null;
+      const data = (window as any).ytInitialData;
+      const dataCurrentId = data?.currentVideoEndpoint?.watchEndpoint?.videoId;
+      // During SPA navigation ytInitialData can briefly describe the old video.
+      if (dataCurrentId && dataCurrentId !== currentId) return null;
+      const nextHref = document.querySelector<HTMLAnchorElement>("a.ytp-next-button[href]")?.href;
+      if (nextHref) {
+        const nextUrl = new URL(nextHref, window.location.href);
+        const linkId = /(^|\.)youtube\.com$/.test(nextUrl.hostname) && nextUrl.pathname === "/watch"
+          ? nextUrl.searchParams.get("v") : null;
+        if (linkId && /^[\w-]{11}$/.test(linkId) && linkId !== currentId) return linkId;
+      }
+      const sets = data?.contents?.twoColumnWatchNextResults?.autoplay?.autoplay?.sets;
+      const nextId = sets?.[0]?.autoplayVideo?.watchEndpoint?.videoId;
+      return typeof nextId === "string" && /^[\w-]{11}$/.test(nextId) && nextId !== currentId
+        ? nextId : null;
+    } catch (_) {
+      return null;
+    }
   }
 
   function getYouTubePlaylistPosition(): { index: number; length: number } | null {
@@ -1202,6 +1227,19 @@ import type {
           return true;
         }
       } catch (_) {}
+    }
+    const suggestedId = getYouTubeSuggestedNextVideoId();
+    if (suggestedId) {
+      const currentId = getYouTubeVideoId();
+      // Prefer YouTube's own control so its navigation and playback behavior
+      // are preserved. Its click may silently do nothing, so verify the route.
+      if (control.button) control.button.click();
+      window.setTimeout(() => {
+        if (getYouTubeVideoId() === currentId) {
+          window.location.assign(`/watch?v=${suggestedId}`);
+        }
+      }, control.button ? 600 : 0);
+      return true;
     }
     if (control.disabled) return false;
     // For ordinary watch pages, this button advances to YouTube's suggested

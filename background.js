@@ -11,6 +11,36 @@
   var pinnedUrls = [];
   var openTabIds = /* @__PURE__ */ new Set();
   var playbackCommandQueues = /* @__PURE__ */ new Map();
+  var youtubeVideoHistory = /* @__PURE__ */ new Map();
+  var youtubeBackTargets = /* @__PURE__ */ new Map();
+  function youtubeWatchVideoId(urlStr) {
+    try {
+      if (!urlStr) return null;
+      const url = new URL(urlStr);
+      if (!/(^|\.)youtube\.com$/.test(url.hostname) || url.pathname !== "/watch") return null;
+      const id = url.searchParams.get("v");
+      return id && /^[\w-]{11}$/.test(id) ? id : null;
+    } catch (_) {
+      return null;
+    }
+  }
+  function recordYouTubeNavigation(tabId, previousUrl, nextUrl) {
+    if (!previousUrl || !nextUrl || previousUrl === nextUrl) return;
+    const oldId = youtubeWatchVideoId(previousUrl);
+    const newId = youtubeWatchVideoId(nextUrl);
+    const backTarget = youtubeBackTargets.get(tabId);
+    if (backTarget && newId === youtubeWatchVideoId(backTarget)) {
+      youtubeBackTargets.delete(tabId);
+    } else if (oldId && newId && oldId !== newId) {
+      const history = youtubeVideoHistory.get(tabId) || [];
+      history.push(previousUrl);
+      youtubeVideoHistory.set(tabId, history.slice(-50));
+      youtubeBackTargets.delete(tabId);
+    } else if (!newId) {
+      youtubeVideoHistory.delete(tabId);
+      youtubeBackTargets.delete(tabId);
+    }
+  }
   function getHostname(urlStr) {
     if (!urlStr) return "";
     try {
@@ -48,7 +78,8 @@
         tabsInfo: serializedTabs,
         lastOrderedTabIds,
         customTabOrder,
-        pinnedTabIds: Array.from(pinnedTabIds)
+        pinnedTabIds: Array.from(pinnedTabIds),
+        youtubeVideoHistory: Object.fromEntries(youtubeVideoHistory)
       });
     } catch (err) {
       console.warn("[MediaControls Background] Failed to persist state:", err);
@@ -62,7 +93,8 @@
           "tabsInfo",
           "lastOrderedTabIds",
           "customTabOrder",
-          "pinnedTabIds"
+          "pinnedTabIds",
+          "youtubeVideoHistory"
         ]),
         browser.storage.local.get(["customOrderUrls", "pinnedUrls"])
       ]);
@@ -97,6 +129,15 @@
       if (Array.isArray(data.pinnedTabIds)) {
         for (const tabId of data.pinnedTabIds) {
           if (typeof tabId === "number") pinnedTabIds.add(tabId);
+        }
+      }
+      if (data.youtubeVideoHistory && typeof data.youtubeVideoHistory === "object") {
+        for (const [tabId, urls] of Object.entries(data.youtubeVideoHistory)) {
+          if (Array.isArray(urls)) {
+            youtubeVideoHistory.set(Number(tabId), urls.filter(
+              (url) => typeof url === "string" && Boolean(youtubeWatchVideoId(url))
+            ).slice(-50));
+          }
         }
       }
       if (Array.isArray(savedOrder.pinnedUrls)) {
@@ -166,13 +207,19 @@
             continue;
           }
         }
+        const history = youtubeVideoHistory.get(tabId);
+        const isOrdinaryYouTubeWatch = youtubeWatchVideoId(tab?.url) && !new URL(tab.url).searchParams.has("list");
+        const state = isOrdinaryYouTubeWatch ? {
+          ...chosenState,
+          actions: history?.length ? Array.from(/* @__PURE__ */ new Set([...chosenState.actions, "previoustrack"])) : chosenState.actions.filter((action) => action !== "previoustrack")
+        } : chosenState;
         sessionsMap.set(tabId, {
           tabId,
           frameId: chosenFrameId,
           hostname: getHostname(tab?.url),
           favIconUrl: tab?.favIconUrl || "",
           tabTitle: tab?.title || chosenState.metadata?.title || "Audio",
-          state: chosenState,
+          state,
           audible: Boolean(tab?.audible),
           muted: Boolean(tab?.muted),
           degraded: false,
@@ -382,6 +429,7 @@
           favIconUrl: "",
           url: ""
         };
+        recordYouTubeNavigation(tab.id, current.url, tab.url);
         tabsInfo.set(tab.id, {
           audible: Boolean(tab.audible),
           muted: Boolean(tab.mutedInfo?.muted),
@@ -435,6 +483,7 @@
             favIconUrl: "",
             url: ""
           };
+          recordYouTubeNavigation(tabId, current.url, sender.tab.url);
           tabsInfo.set(tabId, {
             ...current,
             audible: sender.tab.audible ?? current.audible,
@@ -462,6 +511,7 @@
     }
     const newUrl = changeInfo.url || tab.url;
     const prevUrl = tabsInfo.get(tabId)?.url;
+    recordYouTubeNavigation(tabId, prevUrl, newUrl);
     if (prevUrl && newUrl && prevUrl !== newUrl) {
       try {
         const oldU = new URL(prevUrl);
@@ -515,6 +565,8 @@
     lastOrderedTabIds = lastOrderedTabIds.filter((id) => id !== tabId);
     customTabOrder = customTabOrder.filter((id) => id !== tabId);
     pinnedTabIds.delete(tabId);
+    youtubeVideoHistory.delete(tabId);
+    youtubeBackTargets.delete(tabId);
     persistState();
     broadcastSessions();
   });
@@ -532,6 +584,24 @@
         await readyPromise;
         const msg = rawMsg;
         if (msg.type === "cmd") {
+          if (msg.cmd.action === "previoustrack") {
+            const currentUrl = tabsInfo.get(msg.tabId)?.url;
+            const history = youtubeVideoHistory.get(msg.tabId);
+            if (youtubeWatchVideoId(currentUrl) && !new URL(currentUrl).searchParams.has("list") && history?.length) {
+              const target = history[history.length - 1];
+              youtubeBackTargets.set(msg.tabId, target);
+              try {
+                await browser.tabs.update(msg.tabId, { url: target });
+                history.pop();
+                persistState();
+                broadcastSessions();
+                return;
+              } catch (err) {
+                youtubeBackTargets.delete(msg.tabId);
+                console.warn("[MediaControls Background] Failed to navigate to previous YouTube video:", err);
+              }
+            }
+          }
           const routeCommand = async () => {
             const frameId = msg.frameId ?? 0;
             const relayMsg = {

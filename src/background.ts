@@ -29,6 +29,38 @@ const pinnedTabIds = new Set<number>();
 let pinnedUrls: string[] = [];
 let openTabIds = new Set<number>();
 const playbackCommandQueues = new Map<number, Promise<void>>();
+const youtubeVideoHistory = new Map<number, string[]>();
+const youtubeBackTargets = new Map<number, string>();
+
+function youtubeWatchVideoId(urlStr?: string): string | null {
+  try {
+    if (!urlStr) return null;
+    const url = new URL(urlStr);
+    if (!/(^|\.)youtube\.com$/.test(url.hostname) || url.pathname !== "/watch") return null;
+    const id = url.searchParams.get("v");
+    return id && /^[\w-]{11}$/.test(id) ? id : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function recordYouTubeNavigation(tabId: number, previousUrl?: string, nextUrl?: string) {
+  if (!previousUrl || !nextUrl || previousUrl === nextUrl) return;
+  const oldId = youtubeWatchVideoId(previousUrl);
+  const newId = youtubeWatchVideoId(nextUrl);
+  const backTarget = youtubeBackTargets.get(tabId);
+  if (backTarget && newId === youtubeWatchVideoId(backTarget)) {
+    youtubeBackTargets.delete(tabId);
+  } else if (oldId && newId && oldId !== newId) {
+    const history = youtubeVideoHistory.get(tabId) || [];
+    history.push(previousUrl);
+    youtubeVideoHistory.set(tabId, history.slice(-50));
+    youtubeBackTargets.delete(tabId);
+  } else if (!newId) {
+    youtubeVideoHistory.delete(tabId);
+    youtubeBackTargets.delete(tabId);
+  }
+}
 
 function getHostname(urlStr?: string): string {
   if (!urlStr) return "";
@@ -72,7 +104,8 @@ async function persistState() {
       tabsInfo: serializedTabs,
       lastOrderedTabIds,
       customTabOrder,
-      pinnedTabIds: Array.from(pinnedTabIds)
+      pinnedTabIds: Array.from(pinnedTabIds),
+      youtubeVideoHistory: Object.fromEntries(youtubeVideoHistory)
     });
   } catch (err) {
     console.warn("[MediaControls Background] Failed to persist state:", err);
@@ -87,7 +120,8 @@ async function restoreState() {
         "tabsInfo",
         "lastOrderedTabIds",
         "customTabOrder",
-        "pinnedTabIds"
+        "pinnedTabIds",
+        "youtubeVideoHistory"
       ]),
       browser.storage.local.get(["customOrderUrls", "pinnedUrls"])
     ]);
@@ -126,6 +160,15 @@ async function restoreState() {
     if (Array.isArray(data.pinnedTabIds)) {
       for (const tabId of data.pinnedTabIds) {
         if (typeof tabId === "number") pinnedTabIds.add(tabId);
+      }
+    }
+    if (data.youtubeVideoHistory && typeof data.youtubeVideoHistory === "object") {
+      for (const [tabId, urls] of Object.entries(data.youtubeVideoHistory as Record<string, unknown>)) {
+        if (Array.isArray(urls)) {
+          youtubeVideoHistory.set(Number(tabId), urls.filter(
+            (url): url is string => typeof url === "string" && Boolean(youtubeWatchVideoId(url))
+          ).slice(-50));
+        }
       }
     }
     if (Array.isArray(savedOrder.pinnedUrls)) {
@@ -226,13 +269,25 @@ function resolveSessions(): Session[] {
         }
       }
 
+      const history = youtubeVideoHistory.get(tabId);
+      const isOrdinaryYouTubeWatch = youtubeWatchVideoId(tab?.url) &&
+        !new URL(tab!.url).searchParams.has("list");
+      const state = isOrdinaryYouTubeWatch
+        ? {
+            ...chosenState,
+            actions: history?.length
+              ? Array.from(new Set([...chosenState.actions, "previoustrack" as const]))
+              : chosenState.actions.filter((action) => action !== "previoustrack")
+          }
+        : chosenState;
+
       sessionsMap.set(tabId, {
         tabId,
         frameId: chosenFrameId,
         hostname: getHostname(tab?.url),
         favIconUrl: tab?.favIconUrl || "",
         tabTitle: tab?.title || chosenState.metadata?.title || "Audio",
-        state: chosenState,
+        state,
         audible: Boolean(tab?.audible),
         muted: Boolean(tab?.muted),
         degraded: false,
@@ -478,6 +533,8 @@ async function refreshTabsAndInject() {
         url: ""
       };
 
+      recordYouTubeNavigation(tab.id, current.url, tab.url);
+
       tabsInfo.set(tab.id, {
         audible: Boolean(tab.audible),
         muted: Boolean(tab.mutedInfo?.muted),
@@ -543,6 +600,7 @@ browser.runtime.onMessage.addListener(
           favIconUrl: "",
           url: ""
         };
+        recordYouTubeNavigation(tabId, current.url, sender.tab.url);
         tabsInfo.set(tabId, {
           ...current,
           audible: sender.tab.audible ?? current.audible,
@@ -578,6 +636,7 @@ browser.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
   // Also clear tab frames on SPA navigations (when URL changes without full page reload)
   const newUrl = changeInfo.url || tab.url;
   const prevUrl = tabsInfo.get(tabId)?.url;
+  recordYouTubeNavigation(tabId, prevUrl, newUrl);
   if (prevUrl && newUrl && prevUrl !== newUrl) {
     try {
       const oldU = new URL(prevUrl);
@@ -642,6 +701,8 @@ browser.tabs.onRemoved.addListener(async (tabId) => {
   lastOrderedTabIds = lastOrderedTabIds.filter((id) => id !== tabId);
   customTabOrder = customTabOrder.filter((id) => id !== tabId);
   pinnedTabIds.delete(tabId);
+  youtubeVideoHistory.delete(tabId);
+  youtubeBackTargets.delete(tabId);
   persistState();
   broadcastSessions();
 });
@@ -667,6 +728,25 @@ browser.runtime.onConnect.addListener((port) => {
       await readyPromise;
       const msg = rawMsg as PopupToBgMessage;
       if (msg.type === "cmd") {
+        if (msg.cmd.action === "previoustrack") {
+          const currentUrl = tabsInfo.get(msg.tabId)?.url;
+          const history = youtubeVideoHistory.get(msg.tabId);
+          if (youtubeWatchVideoId(currentUrl) &&
+              !new URL(currentUrl!).searchParams.has("list") && history?.length) {
+            const target = history[history.length - 1];
+            youtubeBackTargets.set(msg.tabId, target);
+            try {
+              await browser.tabs.update(msg.tabId, { url: target });
+              history.pop();
+              persistState();
+              broadcastSessions();
+              return;
+            } catch (err) {
+              youtubeBackTargets.delete(msg.tabId);
+              console.warn("[MediaControls Background] Failed to navigate to previous YouTube video:", err);
+            }
+          }
+        }
         const routeCommand = async () => {
           const frameId = msg.frameId ?? 0;
           const relayMsg: BgToRelayMessage = {
