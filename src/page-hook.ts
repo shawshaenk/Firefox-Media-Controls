@@ -61,6 +61,8 @@ import type {
   let pendingColdPlayUntil = 0;
   // Generation guard so a later command cancels a pending cold-play retry.
   let ytPlayGeneration = 0;
+  let lastPlaybackCommand: "play" | "pause" | null = null;
+  let lastPlaybackCommandAt = 0;
   // True once the browser's autoplay policy has rejected programmatic play
   // (NotAllowedError on both audible and muted attempts, or an exhausted
   // YouTube retry loop). Cleared on real playback or real user interaction.
@@ -501,10 +503,10 @@ import type {
 
   function availableTrackActions(): Action[] {
     const actions: Action[] = [];
-    if (handlers.previoustrack || findClickableButton(PREV_SELECTORS)) {
+    if (isTrackActionAvailable("previoustrack")) {
       actions.push("previoustrack");
     }
-    if (handlers.nexttrack || findClickableButton(NEXT_SELECTORS)) {
+    if (isTrackActionAvailable("nexttrack")) {
       actions.push("nexttrack");
     }
     return actions;
@@ -756,6 +758,8 @@ import type {
 
       // Actions: registered handlers ∪ emulatable
       const actionsSet = new Set<Action>(Object.keys(handlers) as Action[]);
+      actionsSet.delete("previoustrack");
+      actionsSet.delete("nexttrack");
       actionsSet.add("play");
       actionsSet.add("pause");
       for (const action of availableTrackActions()) actionsSet.add(action);
@@ -946,7 +950,9 @@ import type {
           updatedAt: Date.now()
         } : null,
         actions: Array.from(new Set<Action>([
-          ...Object.keys(handlers) as Action[],
+          ...(Object.keys(handlers) as Action[]).filter(
+            (action) => action !== "previoustrack" && action !== "nexttrack"
+          ),
           ...availableTrackActions(),
           "play", "pause",
           ...(previous.seekable ? ["seekto", "seekbackward", "seekforward"] as Action[] : [])
@@ -1039,6 +1045,107 @@ import type {
     ".pause-button",
     "button.pause"
   ];
+  const TRACK_CONTROL_SELECTOR = [
+    ...NEXT_SELECTORS.slice(0, 8),
+    ...PREV_SELECTORS.slice(0, 8)
+  ].join(", ");
+
+  function isTrackButtonDisabled(button: HTMLElement): boolean {
+    try {
+      return button.matches(":disabled") ||
+        button.getAttribute("aria-disabled") === "true" ||
+        button.getAttribute("data-disabled") === "true" ||
+        button.classList.contains("disabled") ||
+        button.classList.contains("is-disabled") ||
+        button.classList.contains("ytp-disabled");
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function isTrackButtonUsable(button: HTMLElement): boolean {
+    try {
+      // Player chrome can disable pointer events while it fades out, but an
+      // enabled transport button can still be activated by click(). Keep
+      // display/visibility checks so a genuinely absent Previous stays off.
+      if (!button.isConnected || isTrackButtonDisabled(button) ||
+          button.closest("[hidden], [inert]")) return false;
+      const style = window.getComputedStyle(button);
+      return style.display !== "none" &&
+        style.visibility !== "hidden" &&
+        button.getClientRects().length > 0;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function getTrackButtonStatus(selectors: string[]): {
+    found: boolean;
+    button: HTMLElement | null;
+    disabled: boolean;
+  } {
+    // The first matching selector is the player's own transport control.
+    // If it is disabled, a later generic "Next" button elsewhere on the page
+    // must not make the track action appear available.
+    for (const selector of selectors) {
+      try {
+        const buttons = document.querySelectorAll<HTMLElement>(selector);
+        if (buttons.length > 0) {
+          const candidates = Array.from(buttons);
+          return {
+            found: true,
+            button: candidates.find(isTrackButtonUsable) || null,
+            disabled: candidates.every(isTrackButtonDisabled)
+          };
+        }
+      } catch (_) {}
+    }
+    for (const selector of selectors) {
+      const button = findButtonInShadowRoots(selector, document);
+      if (button) {
+        return { found: true, button: isTrackButtonUsable(button) ? button : null, disabled: isTrackButtonDisabled(button) };
+      }
+    }
+    return { found: false, button: null, disabled: false };
+  }
+
+  function isTrackActionAvailable(action: "previoustrack" | "nexttrack"): boolean {
+    const playlist = getYouTubePlaylistPosition();
+    if (action === "previoustrack" && playlist && playlist.index === 0) {
+      return false;
+    }
+    if (playlist && (action === "previoustrack"
+      ? playlist.index > 0
+      : playlist.index < playlist.length - 1)) {
+      return true;
+    }
+    const selectors = action === "previoustrack" ? PREV_SELECTORS : NEXT_SELECTORS;
+    const control = getTrackButtonStatus(selectors);
+    if (action === "previoustrack" && getYouTubeVideoId()) {
+      // A watch page can register a Previous handler even when it would only
+      // restart the current video. Require its enabled transport button.
+      return Boolean(control.button);
+    }
+    return Boolean(control.button || (!control.disabled && handlers[action]));
+  }
+
+  function getYouTubePlaylistPosition(): { index: number; length: number } | null {
+    try {
+      const host = window.location.hostname;
+      if (!host.includes("youtube.com") && !host.includes("youtu.be")) return null;
+      // Without an explicit playlist, the page may still have a usable Next
+      // recommendation; the player's own button is authoritative there.
+      if (!new URL(window.location.href).searchParams.has("list")) return null;
+      const player = getYtPlayer();
+      const list = player?.getPlaylist?.();
+      const index = player?.getPlaylistIndex?.();
+      if (Array.isArray(list) && list.length > 0 &&
+          Number.isInteger(index) && index >= 0 && index < list.length) {
+        return { index, length: list.length };
+      }
+    } catch (_) {}
+    return null;
+  }
 
   function findButtonInShadowRoots(selector: string, root: Document | Element | ShadowRoot): HTMLElement | null {
     try {
@@ -1084,18 +1191,25 @@ import type {
     return null;
   }
 
-  function tryClickDomButton(selectors: string[]): boolean {
-    try {
-      const btn = findClickableButton(selectors);
-      if (btn) {
-        btn.click();
-        return true;
-      }
-    } catch (_) {}
-    return false;
-  }
-
   function playNextTrack(): boolean {
+    const control = getTrackButtonStatus(NEXT_SELECTORS);
+    const playlist = getYouTubePlaylistPosition();
+    if (playlist && playlist.index < playlist.length - 1) {
+      try {
+        const player = getYtPlayer();
+        if (typeof player?.nextVideo === "function") {
+          player.nextVideo();
+          return true;
+        }
+      } catch (_) {}
+    }
+    if (control.disabled) return false;
+    // For ordinary watch pages, this button advances to YouTube's suggested
+    // next video even though no explicit playlist is attached to the URL.
+    if (window.location.hostname.includes("youtube.com") && control.button) {
+      control.button.click();
+      return true;
+    }
     // 1. Try MediaSession handler if registered
     if (handlers["nexttrack"]) {
       try {
@@ -1106,14 +1220,32 @@ import type {
       }
     }
 
-    // 2. Try DOM player next buttons
-    if (tryClickDomButton(NEXT_SELECTORS)) {
+    // 2. Try the page's enabled next button
+    if (control.button) {
+      control.button.click();
       return true;
     }
     return false;
   }
 
   function playPreviousTrack(): boolean {
+    const control = getTrackButtonStatus(PREV_SELECTORS);
+    const playlist = getYouTubePlaylistPosition();
+    if (playlist?.index === 0) return false;
+    if (playlist && playlist.index > 0) {
+      try {
+        const player = getYtPlayer();
+        if (typeof player?.previousVideo === "function") {
+          player.previousVideo();
+          return true;
+        }
+      } catch (_) {}
+    }
+    if (control.disabled) return false;
+    if (window.location.hostname.includes("youtube.com") && control.button) {
+      control.button.click();
+      return true;
+    }
     // 1. Try MediaSession handler if registered
     if (handlers["previoustrack"]) {
       try {
@@ -1124,8 +1256,9 @@ import type {
       }
     }
 
-    // 2. Try DOM player previous buttons
-    if (tryClickDomButton(PREV_SELECTORS)) {
+    // 2. Try the page's enabled previous button
+    if (control.button) {
+      control.button.click();
       return true;
     }
     return false;
@@ -1176,13 +1309,13 @@ import type {
     return true;
   }
 
-  function playYouTubeOnce(preferElement = false): boolean {
+  function playYouTubeOnce(preferElement = false, forcePlay = false): boolean {
     const el = activePrimaryElement ||
       pruneAndGetElements().find((candidate) => !isInlinePreviewElement(candidate)) ||
       document.querySelector<HTMLMediaElement>("video, audio");
     if (el && !isInlinePreviewElement(el)) {
       registerElement(el);
-      if (!el.paused && !el.ended) return true;
+      if (!forcePlay && !el.paused && !el.ended) return true;
       if (preferElement && tryPlayElement(el)) return true;
     }
     const yt = getYtPlayer();
@@ -1259,6 +1392,10 @@ import type {
     }
 
     if (cmd.action === "play") {
+      const followsRecentPause = lastPlaybackCommand === "pause" &&
+        Date.now() - lastPlaybackCommandAt < 1000;
+      lastPlaybackCommand = "play";
+      lastPlaybackCommandAt = Date.now();
       const candidate = activePrimaryElement ||
         pruneAndGetElements().find((el) => !isInlinePreviewElement(el)) || null;
       if (!hasConfirmedPlayback &&
@@ -1294,14 +1431,14 @@ import type {
       // Choose one path per press. YouTube controls and many site buttons are
       // toggles; clicking one after playVideo() can pause the video again.
       if (isYouTube) {
-        handled = playYouTubeOnce();
+        handled = playYouTubeOnce(false, followsRecentPause);
         if (handled && el) {
           window.setTimeout(() => {
             if (gen === ytPlayGeneration && !autoplayBlocked && !isYtPlaying() && el.paused) {
               tryPlayElement(el);
               scheduleEvaluation();
             }
-          }, 400);
+          }, followsRecentPause ? 100 : 400);
         }
       } else if (state?.source === "webaudio" && activeAudioContext) {
         try {
@@ -1309,7 +1446,7 @@ import type {
           suspendedByUs.delete(activeAudioContext);
           handled = true;
         } catch (_) {}
-      } else if (el && !el.paused && !el.ended) {
+      } else if (!followsRecentPause && el && !el.paused && !el.ended) {
         handled = true;
       } else if (handlers["play"]) {
         try {
@@ -1350,6 +1487,8 @@ import type {
     }
 
     if (cmd.action === "pause") {
+      lastPlaybackCommand = "pause";
+      lastPlaybackCommandAt = Date.now();
       sessionPlaybackState = "paused";
       // A pause cancels any pending cold-play retries.
       ytPlayGeneration++;
@@ -1718,13 +1857,24 @@ import type {
     try {
       const observer = new MutationObserver((mutations) => {
         let hasNewMedia = false;
+        let trackControlsChanged = false;
         for (const m of mutations) {
+          if (m.type === "attributes") {
+            if (m.target instanceof Element && m.target.matches(TRACK_CONTROL_SELECTOR)) {
+              trackControlsChanged = true;
+            }
+            continue;
+          }
           for (let i = 0; i < m.addedNodes.length; i++) {
             const node = m.addedNodes[i];
             if (node instanceof HTMLMediaElement) {
               registerElement(node);
               hasNewMedia = true;
             } else if (node instanceof Element) {
+              if (node.matches(TRACK_CONTROL_SELECTOR) ||
+                  node.querySelector(TRACK_CONTROL_SELECTOR)) {
+                trackControlsChanged = true;
+              }
               const children = findAllMediaElements(node);
               for (const child of children) {
                 registerElement(child);
@@ -1741,12 +1891,17 @@ import type {
               tryColdYouTubePlayOnce();
             }
           } catch (_) {}
-          scheduleEvaluation();
         }
+        if (hasNewMedia || trackControlsChanged) scheduleEvaluation();
       });
 
       const root = document.documentElement || document;
-      observer.observe(root, { childList: true, subtree: true });
+      observer.observe(root, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+        attributeFilter: ["disabled", "aria-disabled", "data-disabled", "hidden", "class", "style"]
+      });
     } catch (_) {}
   }
   setupMutationObserver();

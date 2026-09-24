@@ -45,6 +45,8 @@
     let lastKnownHref = typeof window !== "undefined" && window.location ? window.location.href : "";
     let pendingColdPlayUntil = 0;
     let ytPlayGeneration = 0;
+    let lastPlaybackCommand = null;
+    let lastPlaybackCommandAt = 0;
     let autoplayBlocked = false;
     let hasConfirmedPlayback = false;
     let hadTrustedGesture = false;
@@ -405,10 +407,10 @@
     }
     function availableTrackActions() {
       const actions = [];
-      if (handlers.previoustrack || findClickableButton(PREV_SELECTORS)) {
+      if (isTrackActionAvailable("previoustrack")) {
         actions.push("previoustrack");
       }
-      if (handlers.nexttrack || findClickableButton(NEXT_SELECTORS)) {
+      if (isTrackActionAvailable("nexttrack")) {
         actions.push("nexttrack");
       }
       return actions;
@@ -589,6 +591,8 @@
           !isLive && (position && position.duration > 0 || primaryEl && isElementSeekable(primaryEl) || handlers["seekto"] || currentFrameState?.seekable)
         );
         const actionsSet = new Set(Object.keys(handlers));
+        actionsSet.delete("previoustrack");
+        actionsSet.delete("nexttrack");
         actionsSet.add("play");
         actionsSet.add("pause");
         for (const action of availableTrackActions()) actionsSet.add(action);
@@ -726,7 +730,9 @@
             updatedAt: Date.now()
           } : null,
           actions: Array.from(/* @__PURE__ */ new Set([
-            ...Object.keys(handlers),
+            ...Object.keys(handlers).filter(
+              (action) => action !== "previoustrack" && action !== "nexttrack"
+            ),
             ...availableTrackActions(),
             "play",
             "pause",
@@ -816,6 +822,79 @@
       ".pause-button",
       "button.pause"
     ];
+    const TRACK_CONTROL_SELECTOR = [
+      ...NEXT_SELECTORS.slice(0, 8),
+      ...PREV_SELECTORS.slice(0, 8)
+    ].join(", ");
+    function isTrackButtonDisabled(button) {
+      try {
+        return button.matches(":disabled") || button.getAttribute("aria-disabled") === "true" || button.getAttribute("data-disabled") === "true" || button.classList.contains("disabled") || button.classList.contains("is-disabled") || button.classList.contains("ytp-disabled");
+      } catch (_) {
+        return false;
+      }
+    }
+    function isTrackButtonUsable(button) {
+      try {
+        if (!button.isConnected || isTrackButtonDisabled(button) || button.closest("[hidden], [inert]")) return false;
+        const style = window.getComputedStyle(button);
+        return style.display !== "none" && style.visibility !== "hidden" && button.getClientRects().length > 0;
+      } catch (_) {
+        return false;
+      }
+    }
+    function getTrackButtonStatus(selectors) {
+      for (const selector of selectors) {
+        try {
+          const buttons = document.querySelectorAll(selector);
+          if (buttons.length > 0) {
+            const candidates = Array.from(buttons);
+            return {
+              found: true,
+              button: candidates.find(isTrackButtonUsable) || null,
+              disabled: candidates.every(isTrackButtonDisabled)
+            };
+          }
+        } catch (_) {
+        }
+      }
+      for (const selector of selectors) {
+        const button = findButtonInShadowRoots(selector, document);
+        if (button) {
+          return { found: true, button: isTrackButtonUsable(button) ? button : null, disabled: isTrackButtonDisabled(button) };
+        }
+      }
+      return { found: false, button: null, disabled: false };
+    }
+    function isTrackActionAvailable(action) {
+      const playlist = getYouTubePlaylistPosition();
+      if (action === "previoustrack" && playlist && playlist.index === 0) {
+        return false;
+      }
+      if (playlist && (action === "previoustrack" ? playlist.index > 0 : playlist.index < playlist.length - 1)) {
+        return true;
+      }
+      const selectors = action === "previoustrack" ? PREV_SELECTORS : NEXT_SELECTORS;
+      const control = getTrackButtonStatus(selectors);
+      if (action === "previoustrack" && getYouTubeVideoId()) {
+        return Boolean(control.button);
+      }
+      return Boolean(control.button || !control.disabled && handlers[action]);
+    }
+    function getYouTubePlaylistPosition() {
+      try {
+        const host = window.location.hostname;
+        if (!host.includes("youtube.com") && !host.includes("youtu.be")) return null;
+        if (!new URL(window.location.href).searchParams.has("list")) return null;
+        const player = getYtPlayer();
+        const list = player?.getPlaylist?.();
+        const index = player?.getPlaylistIndex?.();
+        if (Array.isArray(list) && list.length > 0 && Number.isInteger(index) && index >= 0 && index < list.length) {
+          return { index, length: list.length };
+        }
+      } catch (_) {
+      }
+      return null;
+    }
     function findButtonInShadowRoots(selector, root) {
       try {
         const all = root.querySelectorAll("*");
@@ -854,18 +933,24 @@
       }
       return null;
     }
-    function tryClickDomButton(selectors) {
-      try {
-        const btn = findClickableButton(selectors);
-        if (btn) {
-          btn.click();
-          return true;
-        }
-      } catch (_) {
-      }
-      return false;
-    }
     function playNextTrack() {
+      const control = getTrackButtonStatus(NEXT_SELECTORS);
+      const playlist = getYouTubePlaylistPosition();
+      if (playlist && playlist.index < playlist.length - 1) {
+        try {
+          const player = getYtPlayer();
+          if (typeof player?.nextVideo === "function") {
+            player.nextVideo();
+            return true;
+          }
+        } catch (_) {
+        }
+      }
+      if (control.disabled) return false;
+      if (window.location.hostname.includes("youtube.com") && control.button) {
+        control.button.click();
+        return true;
+      }
       if (handlers["nexttrack"]) {
         try {
           handlers["nexttrack"].call(navigator.mediaSession, { action: "nexttrack" });
@@ -874,12 +959,31 @@
           console.warn("[MediaControls] MediaSession nexttrack handler threw:", err);
         }
       }
-      if (tryClickDomButton(NEXT_SELECTORS)) {
+      if (control.button) {
+        control.button.click();
         return true;
       }
       return false;
     }
     function playPreviousTrack() {
+      const control = getTrackButtonStatus(PREV_SELECTORS);
+      const playlist = getYouTubePlaylistPosition();
+      if (playlist?.index === 0) return false;
+      if (playlist && playlist.index > 0) {
+        try {
+          const player = getYtPlayer();
+          if (typeof player?.previousVideo === "function") {
+            player.previousVideo();
+            return true;
+          }
+        } catch (_) {
+        }
+      }
+      if (control.disabled) return false;
+      if (window.location.hostname.includes("youtube.com") && control.button) {
+        control.button.click();
+        return true;
+      }
       if (handlers["previoustrack"]) {
         try {
           handlers["previoustrack"].call(navigator.mediaSession, { action: "previoustrack" });
@@ -888,7 +992,8 @@
           console.warn("[MediaControls] MediaSession previoustrack handler threw:", err);
         }
       }
-      if (tryClickDomButton(PREV_SELECTORS)) {
+      if (control.button) {
+        control.button.click();
         return true;
       }
       return false;
@@ -938,11 +1043,11 @@
       });
       return true;
     }
-    function playYouTubeOnce(preferElement = false) {
+    function playYouTubeOnce(preferElement = false, forcePlay = false) {
       const el = activePrimaryElement || pruneAndGetElements().find((candidate) => !isInlinePreviewElement(candidate)) || document.querySelector("video, audio");
       if (el && !isInlinePreviewElement(el)) {
         registerElement(el);
-        if (!el.paused && !el.ended) return true;
+        if (!forcePlay && !el.paused && !el.ended) return true;
         if (preferElement && tryPlayElement(el)) return true;
       }
       const yt = getYtPlayer();
@@ -1007,6 +1112,9 @@
         return handled;
       }
       if (cmd.action === "play") {
+        const followsRecentPause = lastPlaybackCommand === "pause" && Date.now() - lastPlaybackCommandAt < 1e3;
+        lastPlaybackCommand = "play";
+        lastPlaybackCommandAt = Date.now();
         const candidate = activePrimaryElement || pruneAndGetElements().find((el2) => !isInlinePreviewElement(el2)) || null;
         if (!hasConfirmedPlayback && (autoplayBlocked || isAutoplayDenied(candidate) === true)) {
           setAutoplayBlocked(true);
@@ -1029,14 +1137,14 @@
           return null;
         })();
         if (isYouTube) {
-          handled = playYouTubeOnce();
+          handled = playYouTubeOnce(false, followsRecentPause);
           if (handled && el) {
             window.setTimeout(() => {
               if (gen === ytPlayGeneration && !autoplayBlocked && !isYtPlaying() && el.paused) {
                 tryPlayElement(el);
                 scheduleEvaluation();
               }
-            }, 400);
+            }, followsRecentPause ? 100 : 400);
           }
         } else if (state?.source === "webaudio" && activeAudioContext) {
           try {
@@ -1046,7 +1154,7 @@
             handled = true;
           } catch (_) {
           }
-        } else if (el && !el.paused && !el.ended) {
+        } else if (!followsRecentPause && el && !el.paused && !el.ended) {
           handled = true;
         } else if (handlers["play"]) {
           try {
@@ -1083,6 +1191,8 @@
         return handled;
       }
       if (cmd.action === "pause") {
+        lastPlaybackCommand = "pause";
+        lastPlaybackCommandAt = Date.now();
         sessionPlaybackState = "paused";
         ytPlayGeneration++;
         pendingColdPlayUntil = 0;
@@ -1437,13 +1547,23 @@
       try {
         const observer = new MutationObserver((mutations) => {
           let hasNewMedia = false;
+          let trackControlsChanged = false;
           for (const m of mutations) {
+            if (m.type === "attributes") {
+              if (m.target instanceof Element && m.target.matches(TRACK_CONTROL_SELECTOR)) {
+                trackControlsChanged = true;
+              }
+              continue;
+            }
             for (let i = 0; i < m.addedNodes.length; i++) {
               const node = m.addedNodes[i];
               if (node instanceof HTMLMediaElement) {
                 registerElement(node);
                 hasNewMedia = true;
               } else if (node instanceof Element) {
+                if (node.matches(TRACK_CONTROL_SELECTOR) || node.querySelector(TRACK_CONTROL_SELECTOR)) {
+                  trackControlsChanged = true;
+                }
                 const children = findAllMediaElements(node);
                 for (const child of children) {
                   registerElement(child);
@@ -1459,11 +1579,16 @@
               }
             } catch (_) {
             }
-            scheduleEvaluation();
           }
+          if (hasNewMedia || trackControlsChanged) scheduleEvaluation();
         });
         const root = document.documentElement || document;
-        observer.observe(root, { childList: true, subtree: true });
+        observer.observe(root, {
+          childList: true,
+          subtree: true,
+          attributes: true,
+          attributeFilter: ["disabled", "aria-disabled", "data-disabled", "hidden", "class", "style"]
+        });
       } catch (_) {
       }
     }

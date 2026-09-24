@@ -6,7 +6,11 @@
   var connectedPopupPorts = /* @__PURE__ */ new Set();
   var lastOrderedTabIds = [];
   var customTabOrder = [];
+  var customOrderUrls = [];
+  var pinnedTabIds = /* @__PURE__ */ new Set();
+  var pinnedUrls = [];
   var openTabIds = /* @__PURE__ */ new Set();
+  var playbackCommandQueues = /* @__PURE__ */ new Map();
   function getHostname(urlStr) {
     if (!urlStr) return "";
     try {
@@ -43,7 +47,8 @@
         registry: serializedRegistry,
         tabsInfo: serializedTabs,
         lastOrderedTabIds,
-        customTabOrder
+        customTabOrder,
+        pinnedTabIds: Array.from(pinnedTabIds)
       });
     } catch (err) {
       console.warn("[MediaControls Background] Failed to persist state:", err);
@@ -51,11 +56,15 @@
   }
   async function restoreState() {
     try {
-      const data = await browser.storage.session.get([
-        "registry",
-        "tabsInfo",
-        "lastOrderedTabIds",
-        "customTabOrder"
+      const [data, savedOrder] = await Promise.all([
+        browser.storage.session.get([
+          "registry",
+          "tabsInfo",
+          "lastOrderedTabIds",
+          "customTabOrder",
+          "pinnedTabIds"
+        ]),
+        browser.storage.local.get(["customOrderUrls", "pinnedUrls"])
       ]);
       if (data.registry && typeof data.registry === "object") {
         registry.clear();
@@ -79,6 +88,21 @@
       }
       if (Array.isArray(data.customTabOrder)) {
         customTabOrder = data.customTabOrder;
+      }
+      if (Array.isArray(savedOrder.customOrderUrls)) {
+        customOrderUrls = savedOrder.customOrderUrls.filter(
+          (url) => typeof url === "string" && url.length > 0
+        );
+      }
+      if (Array.isArray(data.pinnedTabIds)) {
+        for (const tabId of data.pinnedTabIds) {
+          if (typeof tabId === "number") pinnedTabIds.add(tabId);
+        }
+      }
+      if (Array.isArray(savedOrder.pinnedUrls)) {
+        pinnedUrls = savedOrder.pinnedUrls.filter(
+          (url) => typeof url === "string" && url.length > 0
+        );
       }
     } catch (err) {
       console.warn("[MediaControls Background] Failed to restore state:", err);
@@ -151,7 +175,8 @@
           state: chosenState,
           audible: Boolean(tab?.audible),
           muted: Boolean(tab?.muted),
-          degraded: false
+          degraded: false,
+          pinned: false
         });
       }
     }
@@ -170,11 +195,37 @@
           state: null,
           audible: true,
           muted: Boolean(tab.muted),
-          degraded: true
+          degraded: true,
+          pinned: false
         });
       }
     }
     const rawList = Array.from(sessionsMap.values());
+    const availablePinnedUrls = [...pinnedUrls];
+    for (const session of rawList) {
+      if (pinnedTabIds.has(session.tabId)) {
+        session.pinned = true;
+        const urlIndex = availablePinnedUrls.indexOf(tabsInfo.get(session.tabId)?.url || "");
+        if (urlIndex >= 0) availablePinnedUrls.splice(urlIndex, 1);
+      }
+    }
+    for (const session of rawList) {
+      if (session.pinned) continue;
+      const urlIndex = availablePinnedUrls.indexOf(tabsInfo.get(session.tabId)?.url || "");
+      if (urlIndex >= 0) {
+        session.pinned = true;
+        pinnedTabIds.add(session.tabId);
+        availablePinnedUrls.splice(urlIndex, 1);
+      }
+    }
+    const pinnedFirst = (ordered) => {
+      const result = [
+        ...ordered.filter((session) => session.pinned),
+        ...ordered.filter((session) => !session.pinned)
+      ];
+      lastOrderedTabIds = result.map((session) => session.tabId);
+      return result;
+    };
     if (connectedPopupPorts.size > 0 && lastOrderedTabIds.length > 0) {
       const existingSessions = [];
       const newSessions = [];
@@ -195,10 +246,9 @@
         return timeB - timeA;
       });
       const combined = [...newSessions, ...existingSessions];
-      lastOrderedTabIds = combined.map((s) => s.tabId);
-      return combined;
+      return pinnedFirst(combined);
     }
-    if (customTabOrder.length > 0) {
+    if (customTabOrder.length > 0 || customOrderUrls.length > 0) {
       const existingSessions = [];
       const newSessions = [];
       const byId = new Map(rawList.map((s) => [s.tabId, s]));
@@ -207,6 +257,15 @@
         if (s) {
           existingSessions.push(s);
           byId.delete(tabId);
+        }
+      }
+      for (const url of customOrderUrls) {
+        const s = Array.from(byId.values()).find(
+          (candidate) => tabsInfo.get(candidate.tabId)?.url === url
+        );
+        if (s) {
+          existingSessions.push(s);
+          byId.delete(s.tabId);
         }
       }
       for (const s of byId.values()) {
@@ -218,16 +277,14 @@
         return timeB - timeA;
       });
       const combined = [...newSessions, ...existingSessions];
-      lastOrderedTabIds = combined.map((s) => s.tabId);
-      return combined;
+      return pinnedFirst(combined);
     }
     rawList.sort((a, b) => {
       const timeA = a.state?.lastPlayedAt ?? 0;
       const timeB = b.state?.lastPlayedAt ?? 0;
       return timeB - timeA;
     });
-    lastOrderedTabIds = rawList.map((s) => s.tabId);
-    return rawList;
+    return pinnedFirst(rawList);
   }
   function updateToolbarAction(sessions) {
     const hasActiveSessions = sessions.length > 0;
@@ -313,6 +370,9 @@
       }
       lastOrderedTabIds = lastOrderedTabIds.filter((id) => currentOpenIds.has(id));
       customTabOrder = customTabOrder.filter((id) => currentOpenIds.has(id));
+      for (const tabId of pinnedTabIds) {
+        if (!currentOpenIds.has(tabId)) pinnedTabIds.delete(tabId);
+      }
       for (const tab of tabs) {
         if (!tab.id) continue;
         const current = tabsInfo.get(tab.id) || {
@@ -420,6 +480,14 @@
       favIconUrl: "",
       url: ""
     };
+    if (pinnedTabIds.has(tabId) && prevUrl && newUrl && prevUrl !== newUrl) {
+      const urlIndex = pinnedUrls.indexOf(prevUrl);
+      if (urlIndex >= 0) {
+        pinnedUrls[urlIndex] = newUrl;
+        browser.storage.local.set({ pinnedUrls }).catch(() => {
+        });
+      }
+    }
     const isAudible = changeInfo.audible ?? tab.audible ?? current.audible;
     tabsInfo.set(tabId, {
       audible: isAudible,
@@ -446,6 +514,7 @@
     tabsInfo.delete(tabId);
     lastOrderedTabIds = lastOrderedTabIds.filter((id) => id !== tabId);
     customTabOrder = customTabOrder.filter((id) => id !== tabId);
+    pinnedTabIds.delete(tabId);
     persistState();
     broadcastSessions();
   });
@@ -463,20 +532,46 @@
         await readyPromise;
         const msg = rawMsg;
         if (msg.type === "cmd") {
-          const frameId = msg.frameId ?? 0;
-          const relayMsg = {
-            type: "cmd",
-            cmd: msg.cmd
+          const routeCommand = async () => {
+            const frameId = msg.frameId ?? 0;
+            const relayMsg = {
+              type: "cmd",
+              cmd: msg.cmd
+            };
+            let handled = false;
+            try {
+              handled = await browser.tabs.sendMessage(msg.tabId, relayMsg, { frameId }) === true;
+            } catch (err) {
+              if (msg.cmd.action === "play" || msg.cmd.action === "pause") {
+                await injectScriptsIntoTab(msg.tabId);
+                try {
+                  handled = await browser.tabs.sendMessage(msg.tabId, relayMsg, { frameId }) === true;
+                } catch (retryErr) {
+                  console.warn("[MediaControls Background] Failed to send cmd to frame:", retryErr);
+                }
+              } else {
+                console.warn("[MediaControls Background] Failed to send cmd to frame:", err);
+              }
+            }
+            if (!handled && frameId !== 0 && (msg.cmd.action === "nexttrack" || msg.cmd.action === "previoustrack")) {
+              browser.tabs.sendMessage(msg.tabId, relayMsg, { frameId: 0 }).catch(() => {
+              });
+            }
           };
-          let handled = false;
-          try {
-            handled = await browser.tabs.sendMessage(msg.tabId, relayMsg, { frameId }) === true;
-          } catch (err) {
-            console.warn("[MediaControls Background] Failed to send cmd to frame:", err);
-          }
-          if (!handled && frameId !== 0 && (msg.cmd.action === "nexttrack" || msg.cmd.action === "previoustrack")) {
-            browser.tabs.sendMessage(msg.tabId, relayMsg, { frameId: 0 }).catch(() => {
-            });
+          if (msg.cmd.action === "play" || msg.cmd.action === "pause") {
+            const previous = playbackCommandQueues.get(msg.tabId) || Promise.resolve();
+            const queued = previous.catch(() => {
+            }).then(routeCommand);
+            playbackCommandQueues.set(msg.tabId, queued);
+            try {
+              await queued;
+            } finally {
+              if (playbackCommandQueues.get(msg.tabId) === queued) {
+                playbackCommandQueues.delete(msg.tabId);
+              }
+            }
+          } else {
+            await routeCommand();
           }
         } else if (msg.type === "focus") {
           try {
@@ -497,8 +592,33 @@
         } else if (msg.type === "reorder") {
           lastOrderedTabIds = msg.tabIds;
           customTabOrder = msg.tabIds;
+          customOrderUrls = msg.tabIds.map((tabId) => tabsInfo.get(tabId)?.url || "").filter((url) => url.length > 0);
+          try {
+            await browser.storage.local.set({ customOrderUrls });
+          } catch (err) {
+            console.warn("[MediaControls Background] Failed to save card order:", err);
+          }
           persistState();
           broadcastSessions();
+        } else if (msg.type === "pin") {
+          const url = tabsInfo.get(msg.tabId)?.url || "";
+          if (msg.pinned) {
+            if (!pinnedTabIds.has(msg.tabId)) {
+              pinnedTabIds.add(msg.tabId);
+              if (url) pinnedUrls.push(url);
+            }
+          } else {
+            pinnedTabIds.delete(msg.tabId);
+            const urlIndex = pinnedUrls.indexOf(url);
+            if (urlIndex >= 0) pinnedUrls.splice(urlIndex, 1);
+          }
+          void persistState();
+          broadcastSessions();
+          try {
+            await browser.storage.local.set({ pinnedUrls });
+          } catch (err) {
+            console.warn("[MediaControls Background] Failed to save pinned cards:", err);
+          }
         } else if (msg.type === "request-sessions") {
           await refreshTabsAndInject();
           port.postMessage({

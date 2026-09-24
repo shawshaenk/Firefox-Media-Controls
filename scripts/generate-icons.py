@@ -17,8 +17,14 @@ for name, color in (("active", "#FFFFFF"), ("idle", "#FFFFFF")):
         rotated = head.rotate(24, Image.Resampling.BICUBIC, expand=True)
         canvas.alpha_composite(rotated, (round(x * scale - rotated.width / 2),
                                          round(y * scale - rotated.height / 2)))
-    taller = canvas.resize((48 * scale, round(48 * scale * 1.14)), Image.Resampling.BICUBIC)
-    top = (taller.height - canvas.height) // 2
-    canvas = taller.crop((0, top, 48 * scale, top + 48 * scale))
+    # Leave a little canvas margin, then enlarge the drawing by 25% in each
+    # direction. The width slightly exceeds the square canvas and is clipped
+    # by one source pixel per side, keeping the toolbar icon close to full size.
+    bounds = canvas.getchannel("A").getbbox()
+    if bounds is None:
+        raise RuntimeError("The note artwork is empty")
+    artwork = canvas.crop(bounds).resize((50 * scale, 45 * scale), Image.Resampling.LANCZOS)
+    canvas = Image.new("RGBA", (48 * scale, 48 * scale))
+    canvas.alpha_composite(artwork, (-1 * scale, round(1.5 * scale)))
     for size in (16, 32, 48):
         canvas.resize((size, size), Image.Resampling.LANCZOS).save(root / f"{name}-{size}.png")

@@ -12,6 +12,11 @@ import type {
 } from "./shared/protocol";
 
 (() => {
+  // The manifest and background injection can both load this script in the
+  // same frame. Duplicate listeners would execute every popup command twice.
+  if ((window as any).__mcx_relay_installed) return;
+  (window as any).__mcx_relay_installed = true;
+
   const ALLOWED_ACTIONS = new Set<Action>([
     "play",
     "pause",

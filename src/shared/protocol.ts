@@ -56,6 +56,7 @@ export interface Session {
   audible: boolean;
   muted: boolean;
   degraded: boolean;
+  pinned: boolean;
 }
 
 // MAIN -> relay: { __mcx: "up", state: FrameState | null }
@@ -85,6 +86,7 @@ export type PopupToBgMessage =
   | { type: "focus"; tabId: number }
   | { type: "mute"; tabId: number; muted: boolean }
   | { type: "reorder"; tabIds: number[] }
+  | { type: "pin"; tabId: number; pinned: boolean }
   | { type: "request-sessions" };
 
 // bg -> popup (via port):

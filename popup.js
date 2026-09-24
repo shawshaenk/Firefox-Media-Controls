@@ -2,6 +2,7 @@
 (() => {
   // src/popup/icons.ts
   var ICON_PATHS = {
+    push_pin: "M16 9V4h1c.55 0 1-.45 1-1s-.45-1-1-1H7c-.55 0-1 .45-1 1s.45 1 1 1h1v5c0 1.66-1.34 3-3 3v2h6v7l1 1 1-1v-7h6v-2c-1.66 0-3-1.34-3-3Z",
     drag_indicator: "M360-160q-33 0-56.5-23.5T280-240q0-33 23.5-56.5T360-320q33 0 56.5 23.5T440-240q0 33-23.5 56.5T360-160Zm240 0q-33 0-56.5-23.5T520-240q0-33 23.5-56.5T600-320q33 0 56.5 23.5T680-240q0 33-23.5 56.5T600-160ZM360-400q-33 0-56.5-23.5T280-480q0-33 23.5-56.5T360-560q33 0 56.5 23.5T440-480q0 33-23.5 56.5T360-400Zm240 0q-33 0-56.5-23.5T520-480q0-33 23.5-56.5T600-560q33 0 56.5 23.5T680-480q0 33-23.5 56.5T600-400ZM360-640q-33 0-56.5-23.5T280-720q0-33 23.5-56.5T360-800q33 0 56.5 23.5T440-720q0 33-23.5 56.5T360-640Zm240 0q-33 0-56.5-23.5T520-720q0-33 23.5-56.5T600-800q33 0 56.5 23.5T680-720q0 33-23.5 56.5T600-640Z",
     skip_previous: "M220-280v-400q0-17 11.5-28.5T260-720q17 0 28.5 11.5T300-680v400q0 17-11.5 28.5T260-240q-17 0-28.5-11.5T220-280Zm458-1L430-447q-9-6-13.5-14.5T412-480q0-10 4.5-18.5T430-513l248-166q5-4 11-5t11-1q16 0 28 11t12 29v330q0 18-12 29t-28 11q-5 0-11-1t-11-5Z",
     replay_10: "M360-500h-30q-13 0-21.5-8.5T300-530q0-13 8.5-21.5T330-560h60q13 0 21.5 8.5T420-530v180q0 13-8.5 21.5T390-320q-13 0-21.5-8.5T360-350v-150Zm140 180q-17 0-28.5-11.5T460-360v-160q0-17 11.5-28.5T500-560h80q17 0 28.5 11.5T620-520v160q0 17-11.5 28.5T580-320h-80Zm20-60h40v-120h-40v120ZM480-80q-75 0-140.5-28.5t-114-77q-48.5-48.5-77-114T120-440q0-17 11.5-28.5T160-480q17 0 28.5 11.5T200-440q0 117 81.5 198.5T480-160q117 0 198.5-81.5T760-440q0-117-81.5-198.5T480-720h-6l34 34q12 12 11.5 28T508-630q-12 12-28.5 12.5T451-629L348-732q-12-12-12-28t12-28l103-103q12-12 28.5-11.5T508-890q11 12 11.5 28T508-834l-34 34h6q75 0 140.5 28.5t114 77q48.5 48.5 77 114T840-440q0 75-28.5 140.5t-77 114q-48.5 48.5-114 77T480-80Z",
@@ -14,7 +15,7 @@
   };
   function createIcon(name) {
     const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
-    svg.setAttribute("viewBox", "0 -960 960 960");
+    svg.setAttribute("viewBox", name === "push_pin" ? "0 0 24 24" : "0 -960 960 960");
     svg.setAttribute("width", "100%");
     svg.setAttribute("height", "100%");
     svg.setAttribute("fill", "currentColor");
@@ -56,7 +57,8 @@
           state: null,
           audible: true,
           muted: Boolean(tab.mutedInfo?.muted),
-          degraded: true
+          degraded: true,
+          pinned: false
         };
       });
       if (sessions.length > 0) updateSessionsView(sessions);
@@ -94,6 +96,11 @@
         cmd
       });
     }
+  }
+  function isSessionPlaying(session) {
+    if (session.state?.playbackState === "playing") return true;
+    if (session.state?.playbackState === "paused") return false;
+    return session.audible;
   }
   function sendFocus(tabId) {
     if (port) {
@@ -173,11 +180,14 @@
     for (const s of byId.values()) {
       reordered.push(s);
     }
-    currentSessions = reordered;
+    currentSessions = [
+      ...reordered.filter((session) => session.pinned),
+      ...reordered.filter((session) => !session.pinned)
+    ];
     if (port) {
       port.postMessage({
         type: "reorder",
-        tabIds: newTabIds
+        tabIds: currentSessions.map((session) => session.tabId)
       });
     }
   }
@@ -350,6 +360,22 @@
       }
     });
     setupCardDrag(dragHandle, cardEl, session.tabId);
+    const pinBtn = document.createElement("button");
+    pinBtn.className = "card-pin-btn";
+    pinBtn.type = "button";
+    setIcon(pinBtn, "push_pin");
+    pinBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const pinned = !cardDom.session.pinned;
+      const updated = currentSessions.map(
+        (item) => item.tabId === cardDom.session.tabId ? { ...item, pinned } : item
+      );
+      updateSessionsView([
+        ...updated.filter((item) => item.pinned),
+        ...updated.filter((item) => !item.pinned)
+      ]);
+      port?.postMessage({ type: "pin", tabId: cardDom.session.tabId, pinned });
+    });
     const topRowEl = document.createElement("div");
     topRowEl.className = "card-top-row";
     const artworkContainer = document.createElement("div");
@@ -383,7 +409,7 @@
       if (current.degraded) {
         sendMute(current.tabId, !current.muted);
       } else {
-        const isPlaying = cardDom.pendingPlayback ? cardDom.pendingPlayback.state === "playing" : current.state?.playbackState === "playing";
+        const isPlaying = cardDom.pendingPlayback ? cardDom.pendingPlayback.state === "playing" : isSessionPlaying(current);
         const requestedState = isPlaying ? "paused" : "playing";
         sendCommand(current.tabId, current.frameId, {
           action: isPlaying ? "pause" : "play"
@@ -414,6 +440,7 @@
     setIcon(prevBtn, "skip_previous");
     prevBtn.addEventListener("click", (e) => {
       e.stopPropagation();
+      if (cardDom.prevBtn.disabled) return;
       sendCommand(cardDom.session.tabId, cardDom.session.frameId, {
         action: "previoustrack"
       });
@@ -425,6 +452,7 @@
     setIcon(rewBtn, "replay_10");
     rewBtn.addEventListener("click", (e) => {
       e.stopPropagation();
+      if (cardDom.rewBtn.disabled) return;
       sendCommand(cardDom.session.tabId, cardDom.session.frameId, {
         action: "seekbackward",
         offset: 10
@@ -520,6 +548,7 @@
     setIcon(fwdBtn, "forward_10");
     fwdBtn.addEventListener("click", (e) => {
       e.stopPropagation();
+      if (cardDom.fwdBtn.disabled) return;
       sendCommand(cardDom.session.tabId, cardDom.session.frameId, {
         action: "seekforward",
         offset: 10
@@ -532,6 +561,7 @@
     setIcon(nextBtn, "skip_next");
     nextBtn.addEventListener("click", (e) => {
       e.stopPropagation();
+      if (cardDom.nextBtn.disabled) return;
       sendCommand(cardDom.session.tabId, cardDom.session.frameId, {
         action: "nexttrack"
       });
@@ -550,6 +580,7 @@
     bottomRowEl.addEventListener("mousedown", (e) => {
       e.stopPropagation();
     });
+    cardEl.appendChild(pinBtn);
     cardEl.appendChild(dragHandle);
     cardEl.appendChild(topRowEl);
     cardEl.appendChild(bottomRowEl);
@@ -574,6 +605,7 @@
       fwdBtn,
       nextBtn,
       dragHandle,
+      pinBtn,
       session,
       isDragging: false,
       dragPct: 0,
@@ -596,7 +628,7 @@
       return;
     }
     const blocked = session.state?.playBlocked === true;
-    const isPlaying = card.pendingPlayback ? card.pendingPlayback.state === "playing" : session.state?.playbackState === "playing";
+    const isPlaying = card.pendingPlayback ? card.pendingPlayback.state === "playing" : isSessionPlaying(session);
     setIcon(card.playBtn, isPlaying ? "pause" : "play_arrow");
     if (blocked && !isPlaying) {
       card.playBtn.disabled = true;
@@ -666,6 +698,10 @@
     }
     card.session = session;
     card.cardEl.dataset.tabId = String(session.tabId);
+    card.pinBtn.classList.toggle("is-pinned", session.pinned);
+    card.pinBtn.setAttribute("aria-pressed", String(session.pinned));
+    card.pinBtn.setAttribute("aria-label", session.pinned ? "Unpin card" : "Pin card to top");
+    card.pinBtn.title = session.pinned ? "Unpin card" : "Pin card to top";
     const hostname = session.hostname || "browser";
     card.sourceHostname.textContent = hostname;
     if (session.favIconUrl) {
@@ -715,11 +751,20 @@
     card.bottomRowEl.style.display = "flex";
     const actions = session.state?.actions || [];
     const isSeekable = Boolean(session.state?.seekable && !session.state?.isLive);
+    const playbackBlocked = session.state?.playBlocked === true;
     card.prevBtn.classList.remove("is-hidden");
     card.nextBtn.classList.remove("is-hidden");
+    card.prevBtn.disabled = !actions.includes("previoustrack");
+    card.nextBtn.disabled = !actions.includes("nexttrack");
+    card.prevBtn.title = card.prevBtn.disabled ? "No previous track available" : "Previous track";
+    card.nextBtn.title = card.nextBtn.disabled ? "No next track available" : "Next track";
     if (isSeekable) {
       card.rewBtn.classList.remove("is-hidden");
       card.fwdBtn.classList.remove("is-hidden");
+      card.rewBtn.disabled = playbackBlocked || !actions.includes("seekbackward");
+      card.fwdBtn.disabled = playbackBlocked || !actions.includes("seekforward");
+      card.rewBtn.title = playbackBlocked ? "Seek unavailable while playback is blocked" : card.rewBtn.disabled ? "Seek backward unavailable" : "Seek backward 10 seconds";
+      card.fwdBtn.title = playbackBlocked ? "Seek unavailable while playback is blocked" : card.fwdBtn.disabled ? "Seek forward unavailable" : "Seek forward 10 seconds";
       card.sliderContainer.style.display = "flex";
     } else {
       card.rewBtn.classList.add("is-hidden");
@@ -872,7 +917,8 @@
         },
         audible: true,
         muted: false,
-        degraded: false
+        degraded: false,
+        pinned: false
       };
       const mockSession2 = {
         tabId: 2,
@@ -902,7 +948,8 @@
         },
         audible: false,
         muted: false,
-        degraded: false
+        degraded: false,
+        pinned: false
       };
       const mockSession3 = {
         tabId: 3,
@@ -913,7 +960,8 @@
         state: null,
         audible: true,
         muted: false,
-        degraded: true
+        degraded: true,
+        pinned: false
       };
       currentSessions = isMulti ? [mockSession1, mockSession2, mockSession3] : [mockSession1];
       updateSessionsView(currentSessions);

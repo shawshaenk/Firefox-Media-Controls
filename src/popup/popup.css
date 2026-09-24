@@ -156,22 +156,15 @@ scrollbar {
   align-items: center;
   justify-content: center;
   color: var(--control-icon);
-  opacity: 0.35;
   cursor: grab !important;
   border-radius: 4px;
-  transition: opacity 0.15s ease, background-color 0.15s ease, color 0.15s ease;
+  transition: background-color 0.15s ease;
   z-index: 2;
   user-select: none;
 }
 
-.media-card:hover .card-drag-handle {
-  opacity: 0.75;
-}
-
 .card-drag-handle:hover {
-  opacity: 1;
   background-color: var(--state-layer-hover);
-  color: var(--text-title);
   cursor: grab !important;
 }
 
@@ -181,7 +174,6 @@ scrollbar {
 }
 
 .card-drag-handle:focus-visible {
-  opacity: 1;
   outline: 2px solid var(--focus-ring);
   outline-offset: 1px;
 }
@@ -189,6 +181,43 @@ scrollbar {
 .card-drag-handle svg {
   width: 18px;
   height: 18px;
+  pointer-events: none;
+}
+
+.card-pin-btn {
+  position: absolute;
+  top: 10px;
+  right: 40px;
+  width: 24px;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--control-icon);
+  cursor: pointer;
+  z-index: 2;
+}
+
+.card-pin-btn:hover,
+.card-pin-btn:focus-visible {
+  background-color: var(--state-layer-hover);
+}
+
+.card-pin-btn.is-pinned {
+  color: var(--slider-active);
+}
+
+.card-pin-btn:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
+}
+
+.card-pin-btn svg {
+  width: 17px;
+  height: 17px;
   pointer-events: none;
 }
 
@@ -311,6 +340,7 @@ scrollbar {
   flex-shrink: 0;
   transition: filter 0.15s ease;
   position: relative;
+  top: 15px;
   outline: none;
   margin-top: 4px;
 }
@@ -372,12 +402,24 @@ scrollbar {
   transition: background-color 0.15s ease;
 }
 
-.ctrl-btn:hover::after {
+.ctrl-btn:not(:disabled):hover::after {
   content: "";
   position: absolute;
   inset: 0;
   border-radius: 50%;
   background-color: var(--state-layer-hover);
+}
+
+.ctrl-btn:disabled {
+  opacity: 0.38;
+  cursor: default;
+}
+
+.prev-btn:disabled,
+.next-btn:disabled,
+.rew-btn:disabled,
+.fwd-btn:disabled {
+  cursor: not-allowed;
 }
 
 .ctrl-btn:focus-visible {

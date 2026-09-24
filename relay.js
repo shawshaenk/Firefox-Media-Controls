@@ -2,6 +2,8 @@
 (() => {
   // src/relay.ts
   (() => {
+    if (window.__mcx_relay_installed) return;
+    window.__mcx_relay_installed = true;
     const ALLOWED_ACTIONS = /* @__PURE__ */ new Set([
       "play",
       "pause",

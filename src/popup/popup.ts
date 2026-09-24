@@ -30,6 +30,7 @@ interface CardDom {
   fwdBtn: HTMLButtonElement;
   nextBtn: HTMLButtonElement;
   dragHandle: HTMLElement;
+  pinBtn: HTMLButtonElement;
 
   // State tracking
   session: Session;
@@ -72,7 +73,8 @@ async function showAudibleFallback() {
       return {
         tabId: tab.id!, frameId: 0, hostname,
         favIconUrl: tab.favIconUrl || "", tabTitle: tab.title || "Audible tab",
-        state: null, audible: true, muted: Boolean(tab.mutedInfo?.muted), degraded: true
+        state: null, audible: true, muted: Boolean(tab.mutedInfo?.muted), degraded: true,
+        pinned: false
       };
     });
     if (sessions.length > 0) updateSessionsView(sessions);
@@ -116,6 +118,12 @@ function sendCommand(tabId: number, frameId: number, cmd: Command) {
       cmd
     } as PopupToBgMessage);
   }
+}
+
+function isSessionPlaying(session: Session): boolean {
+  if (session.state?.playbackState === "playing") return true;
+  if (session.state?.playbackState === "paused") return false;
+  return session.audible;
 }
 
 function sendFocus(tabId: number) {
@@ -209,12 +217,15 @@ function commitCardOrder() {
   for (const s of byId.values()) {
     reordered.push(s);
   }
-  currentSessions = reordered;
+  currentSessions = [
+    ...reordered.filter((session) => session.pinned),
+    ...reordered.filter((session) => !session.pinned)
+  ];
 
   if (port) {
     port.postMessage({
       type: "reorder",
-      tabIds: newTabIds
+      tabIds: currentSessions.map((session) => session.tabId)
     } as PopupToBgMessage);
   }
 }
@@ -437,6 +448,23 @@ function createCardDom(session: Session): CardDom {
 
   setupCardDrag(dragHandle, cardEl, session.tabId);
 
+  const pinBtn = document.createElement("button");
+  pinBtn.className = "card-pin-btn";
+  pinBtn.type = "button";
+  setIcon(pinBtn, "push_pin");
+  pinBtn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    const pinned = !cardDom.session.pinned;
+    const updated = currentSessions.map((item) =>
+      item.tabId === cardDom.session.tabId ? { ...item, pinned } : item
+    );
+    updateSessionsView([
+      ...updated.filter((item) => item.pinned),
+      ...updated.filter((item) => !item.pinned)
+    ]);
+    port?.postMessage({ type: "pin", tabId: cardDom.session.tabId, pinned } as PopupToBgMessage);
+  });
+
   // Top Row
   const topRowEl = document.createElement("div");
   topRowEl.className = "card-top-row";
@@ -484,9 +512,11 @@ function createCardDom(session: Session): CardDom {
     if (current.degraded) {
       sendMute(current.tabId, !current.muted);
     } else {
+      // Follow the state shown by the button so a quick Pause then Play sends
+      // both commands, even before the page reports the pause transition.
       const isPlaying = cardDom.pendingPlayback
         ? cardDom.pendingPlayback.state === "playing"
-        : current.state?.playbackState === "playing";
+        : isSessionPlaying(current);
       const requestedState = isPlaying ? "paused" : "playing";
       sendCommand(current.tabId, current.frameId, {
         action: isPlaying ? "pause" : "play"
@@ -521,6 +551,7 @@ function createCardDom(session: Session): CardDom {
   setIcon(prevBtn, "skip_previous");
   prevBtn.addEventListener("click", (e) => {
     e.stopPropagation();
+    if (cardDom.prevBtn.disabled) return;
     sendCommand(cardDom.session.tabId, cardDom.session.frameId, {
       action: "previoustrack"
     });
@@ -533,6 +564,7 @@ function createCardDom(session: Session): CardDom {
   setIcon(rewBtn, "replay_10");
   rewBtn.addEventListener("click", (e) => {
     e.stopPropagation();
+    if (cardDom.rewBtn.disabled) return;
     sendCommand(cardDom.session.tabId, cardDom.session.frameId, {
       action: "seekbackward",
       offset: 10
@@ -648,6 +680,7 @@ function createCardDom(session: Session): CardDom {
   setIcon(fwdBtn, "forward_10");
   fwdBtn.addEventListener("click", (e) => {
     e.stopPropagation();
+    if (cardDom.fwdBtn.disabled) return;
     sendCommand(cardDom.session.tabId, cardDom.session.frameId, {
       action: "seekforward",
       offset: 10
@@ -661,6 +694,7 @@ function createCardDom(session: Session): CardDom {
   setIcon(nextBtn, "skip_next");
   nextBtn.addEventListener("click", (e) => {
     e.stopPropagation();
+    if (cardDom.nextBtn.disabled) return;
     sendCommand(cardDom.session.tabId, cardDom.session.frameId, {
       action: "nexttrack"
     });
@@ -683,6 +717,7 @@ function createCardDom(session: Session): CardDom {
     e.stopPropagation();
   });
 
+  cardEl.appendChild(pinBtn);
   cardEl.appendChild(dragHandle);
   cardEl.appendChild(topRowEl);
   cardEl.appendChild(bottomRowEl);
@@ -708,6 +743,7 @@ function createCardDom(session: Session): CardDom {
     fwdBtn,
     nextBtn,
     dragHandle,
+    pinBtn,
     session,
     isDragging: false,
     dragPct: 0,
@@ -734,7 +770,7 @@ function updatePlayButton(card: CardDom) {
   const blocked = session.state?.playBlocked === true;
   const isPlaying = card.pendingPlayback
     ? card.pendingPlayback.state === "playing"
-    : session.state?.playbackState === "playing";
+    : isSessionPlaying(session);
   setIcon(card.playBtn, isPlaying ? "pause" : "play_arrow");
   if (blocked && !isPlaying) {
     // The page has not played yet and Firefox forbids script initiated play.
@@ -824,6 +860,10 @@ function updateCardDom(card: CardDom, session: Session) {
   }
   card.session = session;
   card.cardEl.dataset.tabId = String(session.tabId);
+  card.pinBtn.classList.toggle("is-pinned", session.pinned);
+  card.pinBtn.setAttribute("aria-pressed", String(session.pinned));
+  card.pinBtn.setAttribute("aria-label", session.pinned ? "Unpin card" : "Pin card to top");
+  card.pinBtn.title = session.pinned ? "Unpin card" : "Pin card to top";
 
   // 1. Text column
   const hostname = session.hostname || "browser";
@@ -887,15 +927,28 @@ function updateCardDom(card: CardDom, session: Session) {
   // Actions visibility
   const actions = session.state?.actions || [];
   const isSeekable = Boolean(session.state?.seekable && !session.state?.isLive);
+  const playbackBlocked = session.state?.playBlocked === true;
 
-  // Prev / Next buttons: always visible and functional on each audio card
+  // Keep the controls in place, but disable unavailable track actions.
   card.prevBtn.classList.remove("is-hidden");
   card.nextBtn.classList.remove("is-hidden");
+  card.prevBtn.disabled = !actions.includes("previoustrack");
+  card.nextBtn.disabled = !actions.includes("nexttrack");
+  card.prevBtn.title = card.prevBtn.disabled ? "No previous track available" : "Previous track";
+  card.nextBtn.title = card.nextBtn.disabled ? "No next track available" : "Next track";
 
   // ±10s skip buttons & slider
   if (isSeekable) {
     card.rewBtn.classList.remove("is-hidden");
     card.fwdBtn.classList.remove("is-hidden");
+    card.rewBtn.disabled = playbackBlocked || !actions.includes("seekbackward");
+    card.fwdBtn.disabled = playbackBlocked || !actions.includes("seekforward");
+    card.rewBtn.title = playbackBlocked
+      ? "Seek unavailable while playback is blocked"
+      : card.rewBtn.disabled ? "Seek backward unavailable" : "Seek backward 10 seconds";
+    card.fwdBtn.title = playbackBlocked
+      ? "Seek unavailable while playback is blocked"
+      : card.fwdBtn.disabled ? "Seek forward unavailable" : "Seek forward 10 seconds";
     card.sliderContainer.style.display = "flex";
   } else {
     card.rewBtn.classList.add("is-hidden");
@@ -1081,7 +1134,8 @@ async function initPopup() {
       },
       audible: true,
       muted: false,
-      degraded: false
+      degraded: false,
+      pinned: false
     };
 
     const mockSession2: Session = {
@@ -1112,7 +1166,8 @@ async function initPopup() {
       },
       audible: false,
       muted: false,
-      degraded: false
+      degraded: false,
+      pinned: false
     };
 
     const mockSession3: Session = {
@@ -1124,7 +1179,8 @@ async function initPopup() {
       state: null,
       audible: true,
       muted: false,
-      degraded: true
+      degraded: true,
+      pinned: false
     };
 
     currentSessions = isMulti ? [mockSession1, mockSession2, mockSession3] : [mockSession1];

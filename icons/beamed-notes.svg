@@ -1,7 +1,9 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48">
-  <g fill="#fff" transform="translate(0 -3.36) scale(1 1.14)">
-    <path d="M17 9 43 3v8l-26 6zM17 15h4v20h-4zM39 9h4v20h-4z"/>
-    <ellipse cx="12" cy="36" rx="8" ry="5" transform="rotate(-24 12 36)"/>
-    <ellipse cx="34" cy="30" rx="8" ry="5" transform="rotate(-24 34 30)"/>
+  <g transform="translate(-6 -6) scale(1.25)">
+    <g fill="#fff" transform="translate(-0.45 3.21) scale(1.032 0.929)">
+      <path d="M17 9 43 3v8l-26 6zM17 15h4v20h-4zM39 9h4v20h-4z"/>
+      <ellipse cx="12" cy="36" rx="8" ry="5" transform="rotate(-24 12 36)"/>
+      <ellipse cx="34" cy="30" rx="8" ry="5" transform="rotate(-24 34 30)"/>
+    </g>
   </g>
 </svg>
