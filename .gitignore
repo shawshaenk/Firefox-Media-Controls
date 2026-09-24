@@ -1,0 +1,15 @@
+node_modules/
+dev/*profile*/
+dev/*.png
+dist/
+.agents/
+.codex/
+.env
+.env.*
+.amo.json
+*.pem
+*.key
+*.sqlite*
+*.db
+*.db-*
+*.log

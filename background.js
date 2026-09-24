@@ -1,0 +1,545 @@
+"use strict";
+(() => {
+  // src/background.ts
+  var registry = /* @__PURE__ */ new Map();
+  var tabsInfo = /* @__PURE__ */ new Map();
+  var connectedPopupPorts = /* @__PURE__ */ new Set();
+  var lastOrderedTabIds = [];
+  var customTabOrder = [];
+  var openTabIds = /* @__PURE__ */ new Set();
+  function getHostname(urlStr) {
+    if (!urlStr) return "";
+    try {
+      const url = new URL(urlStr);
+      return url.hostname;
+    } catch (_) {
+      return "";
+    }
+  }
+  function isYouTubeWatchUrl(urlStr) {
+    if (!urlStr) return false;
+    try {
+      const u = new URL(urlStr);
+      if (!u.hostname.includes("youtube.com") && !u.hostname.includes("youtu.be")) return false;
+      return u.pathname.includes("/watch") || u.pathname.startsWith("/shorts") || u.pathname.startsWith("/live");
+    } catch (_) {
+      return false;
+    }
+  }
+  async function persistState() {
+    try {
+      const serializedRegistry = {};
+      for (const [tabId, frameMap] of registry.entries()) {
+        serializedRegistry[String(tabId)] = {};
+        for (const [frameId, state] of frameMap.entries()) {
+          serializedRegistry[String(tabId)][String(frameId)] = state;
+        }
+      }
+      const serializedTabs = {};
+      for (const [tabId, info] of tabsInfo.entries()) {
+        serializedTabs[String(tabId)] = info;
+      }
+      await browser.storage.session.set({
+        registry: serializedRegistry,
+        tabsInfo: serializedTabs,
+        lastOrderedTabIds,
+        customTabOrder
+      });
+    } catch (err) {
+      console.warn("[MediaControls Background] Failed to persist state:", err);
+    }
+  }
+  async function restoreState() {
+    try {
+      const data = await browser.storage.session.get([
+        "registry",
+        "tabsInfo",
+        "lastOrderedTabIds",
+        "customTabOrder"
+      ]);
+      if (data.registry && typeof data.registry === "object") {
+        registry.clear();
+        for (const [tabIdStr, frameMapObj] of Object.entries(data.registry)) {
+          const tabId = Number(tabIdStr);
+          const frameMap = /* @__PURE__ */ new Map();
+          for (const [frameIdStr, state] of Object.entries(frameMapObj)) {
+            frameMap.set(Number(frameIdStr), state);
+          }
+          registry.set(tabId, frameMap);
+        }
+      }
+      if (data.tabsInfo && typeof data.tabsInfo === "object") {
+        tabsInfo.clear();
+        for (const [tabIdStr, info] of Object.entries(data.tabsInfo)) {
+          tabsInfo.set(Number(tabIdStr), info);
+        }
+      }
+      if (Array.isArray(data.lastOrderedTabIds)) {
+        lastOrderedTabIds = data.lastOrderedTabIds;
+      }
+      if (Array.isArray(data.customTabOrder)) {
+        customTabOrder = data.customTabOrder;
+      }
+    } catch (err) {
+      console.warn("[MediaControls Background] Failed to restore state:", err);
+    }
+  }
+  var RETENTION_MS = 60 * 60 * 1e3;
+  function resolveSessions() {
+    const now = Date.now();
+    const sessionsMap = /* @__PURE__ */ new Map();
+    for (const [tabId, frameMap] of registry.entries()) {
+      if (openTabIds.size > 0 && !openTabIds.has(tabId)) {
+        registry.delete(tabId);
+        continue;
+      }
+      const tab = tabsInfo.get(tabId);
+      let chosenFrameId = 0;
+      let chosenState = null;
+      let bestPlayingMediaSession = null;
+      let bestPlayingElement = null;
+      let bestPausedMediaSession = null;
+      let bestPausedElement = null;
+      let bestWebAudio = null;
+      for (const [frameId, state] of frameMap.entries()) {
+        if (!state) continue;
+        if (state.source === "mediasession" && state.playbackState === "playing") {
+          if (!bestPlayingMediaSession || state.lastPlayedAt > bestPlayingMediaSession.state.lastPlayedAt) {
+            bestPlayingMediaSession = { frameId, state };
+          }
+        } else if (state.source === "element" && state.playbackState === "playing") {
+          if (!bestPlayingElement || state.lastPlayedAt > bestPlayingElement.state.lastPlayedAt) {
+            bestPlayingElement = { frameId, state };
+          }
+        } else if (state.source === "mediasession" && state.playbackState === "paused") {
+          if (!bestPausedMediaSession || state.lastPlayedAt > bestPausedMediaSession.state.lastPlayedAt) {
+            bestPausedMediaSession = { frameId, state };
+          }
+        } else if (state.playbackState === "paused") {
+          if (!bestPausedElement || state.lastPlayedAt > bestPausedElement.state.lastPlayedAt) {
+            bestPausedElement = { frameId, state };
+          }
+        } else if (state.source === "webaudio") {
+          if (!bestWebAudio || state.lastPlayedAt > bestWebAudio.state.lastPlayedAt) {
+            bestWebAudio = { frameId, state };
+          }
+        }
+      }
+      const candidate = bestPlayingMediaSession || bestPlayingElement || bestPausedMediaSession || bestPausedElement || bestWebAudio;
+      if (candidate) {
+        chosenFrameId = candidate.frameId;
+        chosenState = candidate.state;
+        if (chosenState.playbackState === "paused" && now - chosenState.lastPlayedAt > RETENTION_MS) {
+          frameMap.delete(chosenFrameId);
+          continue;
+        }
+        const isYt = tab?.url && (tab.url.includes("youtube.com") || tab.url.includes("youtu.be")) || chosenState.metadata?.album === "YouTube";
+        if (isYt) {
+          const isWatch = isYouTubeWatchUrl(tab?.url);
+          const isAudibleOrPlaying = Boolean(tab?.audible) || chosenState.playbackState === "playing";
+          if (!isWatch && !isAudibleOrPlaying) {
+            frameMap.delete(chosenFrameId);
+            continue;
+          }
+        }
+        sessionsMap.set(tabId, {
+          tabId,
+          frameId: chosenFrameId,
+          hostname: getHostname(tab?.url),
+          favIconUrl: tab?.favIconUrl || "",
+          tabTitle: tab?.title || chosenState.metadata?.title || "Audio",
+          state: chosenState,
+          audible: Boolean(tab?.audible),
+          muted: Boolean(tab?.muted),
+          degraded: false
+        });
+      }
+    }
+    for (const [tabId, tab] of tabsInfo.entries()) {
+      if (openTabIds.size > 0 && !openTabIds.has(tabId)) {
+        tabsInfo.delete(tabId);
+        continue;
+      }
+      if (tab.audible && !sessionsMap.has(tabId)) {
+        sessionsMap.set(tabId, {
+          tabId,
+          frameId: 0,
+          hostname: getHostname(tab.url),
+          favIconUrl: tab.favIconUrl || "",
+          tabTitle: tab.title || "Audible tab",
+          state: null,
+          audible: true,
+          muted: Boolean(tab.muted),
+          degraded: true
+        });
+      }
+    }
+    const rawList = Array.from(sessionsMap.values());
+    if (connectedPopupPorts.size > 0 && lastOrderedTabIds.length > 0) {
+      const existingSessions = [];
+      const newSessions = [];
+      const byId = new Map(rawList.map((s) => [s.tabId, s]));
+      for (const tabId of lastOrderedTabIds) {
+        const s = byId.get(tabId);
+        if (s) {
+          existingSessions.push(s);
+          byId.delete(tabId);
+        }
+      }
+      for (const s of byId.values()) {
+        newSessions.push(s);
+      }
+      newSessions.sort((a, b) => {
+        const timeA = a.state?.lastPlayedAt ?? 0;
+        const timeB = b.state?.lastPlayedAt ?? 0;
+        return timeB - timeA;
+      });
+      const combined = [...newSessions, ...existingSessions];
+      lastOrderedTabIds = combined.map((s) => s.tabId);
+      return combined;
+    }
+    if (customTabOrder.length > 0) {
+      const existingSessions = [];
+      const newSessions = [];
+      const byId = new Map(rawList.map((s) => [s.tabId, s]));
+      for (const tabId of customTabOrder) {
+        const s = byId.get(tabId);
+        if (s) {
+          existingSessions.push(s);
+          byId.delete(tabId);
+        }
+      }
+      for (const s of byId.values()) {
+        newSessions.push(s);
+      }
+      newSessions.sort((a, b) => {
+        const timeA = a.state?.lastPlayedAt ?? 0;
+        const timeB = b.state?.lastPlayedAt ?? 0;
+        return timeB - timeA;
+      });
+      const combined = [...newSessions, ...existingSessions];
+      lastOrderedTabIds = combined.map((s) => s.tabId);
+      return combined;
+    }
+    rawList.sort((a, b) => {
+      const timeA = a.state?.lastPlayedAt ?? 0;
+      const timeB = b.state?.lastPlayedAt ?? 0;
+      return timeB - timeA;
+    });
+    lastOrderedTabIds = rawList.map((s) => s.tabId);
+    return rawList;
+  }
+  function updateToolbarAction(sessions) {
+    const hasActiveSessions = sessions.length > 0;
+    const trackedTabCount = sessions.length;
+    const iconPrefix = hasActiveSessions ? "icons/active" : "icons/idle";
+    browser.action.setIcon({
+      path: {
+        "16": `${iconPrefix}-16.png`,
+        "32": `${iconPrefix}-32.png`,
+        "48": `${iconPrefix}-48.png`
+      }
+    }).catch(() => {
+    });
+    browser.action.setBadgeBackgroundColor({ color: "#5F6368" }).catch(() => {
+    });
+    browser.action.setBadgeText({
+      text: trackedTabCount > 0 ? String(trackedTabCount) : ""
+    }).catch(() => {
+    });
+    browser.action.enable().catch(() => {
+    });
+    browser.action.setTitle({
+      title: hasActiveSessions ? "Media controls" : "No media playing"
+    }).catch(() => {
+    });
+  }
+  function broadcastSessions() {
+    const sessions = resolveSessions();
+    updateToolbarAction(sessions);
+    const msg = {
+      type: "sessions",
+      sessions
+    };
+    for (const port of connectedPopupPorts) {
+      try {
+        port.postMessage(msg);
+      } catch (_) {
+        connectedPopupPorts.delete(port);
+      }
+    }
+  }
+  async function injectScriptsIntoTab(tabId) {
+    try {
+      const tab = await browser.tabs.get(tabId);
+      if (!tab.url || !tab.url.startsWith("http://") && !tab.url.startsWith("https://")) {
+        return;
+      }
+      await browser.scripting.executeScript({
+        target: { tabId, allFrames: true },
+        files: ["page-hook.js"],
+        world: "MAIN"
+      }).catch(() => {
+      });
+      await browser.scripting.executeScript({
+        target: { tabId, allFrames: true },
+        files: ["relay.js"]
+      }).catch(() => {
+      });
+      browser.tabs.sendMessage(tabId, { type: "query-state" }).catch(() => {
+      });
+    } catch (_) {
+    }
+  }
+  async function refreshTabsAndInject() {
+    try {
+      const tabs = await browser.tabs.query({});
+      const currentOpenIds = /* @__PURE__ */ new Set();
+      for (const tab of tabs) {
+        if (typeof tab.id === "number") {
+          currentOpenIds.add(tab.id);
+        }
+      }
+      openTabIds = currentOpenIds;
+      for (const tabId of Array.from(registry.keys())) {
+        if (!currentOpenIds.has(tabId)) {
+          registry.delete(tabId);
+        }
+      }
+      for (const tabId of Array.from(tabsInfo.keys())) {
+        if (!currentOpenIds.has(tabId)) {
+          tabsInfo.delete(tabId);
+        }
+      }
+      lastOrderedTabIds = lastOrderedTabIds.filter((id) => currentOpenIds.has(id));
+      customTabOrder = customTabOrder.filter((id) => currentOpenIds.has(id));
+      for (const tab of tabs) {
+        if (!tab.id) continue;
+        const current = tabsInfo.get(tab.id) || {
+          audible: false,
+          muted: false,
+          title: "",
+          favIconUrl: "",
+          url: ""
+        };
+        tabsInfo.set(tab.id, {
+          audible: Boolean(tab.audible),
+          muted: Boolean(tab.mutedInfo?.muted),
+          title: tab.title || current.title,
+          favIconUrl: tab.favIconUrl || current.favIconUrl,
+          url: tab.url || current.url
+        });
+        const hasFrames = registry.has(tab.id) && (registry.get(tab.id)?.size ?? 0) > 0;
+        if (tab.audible && !hasFrames) {
+          void injectScriptsIntoTab(tab.id);
+        }
+        browser.tabs.sendMessage(tab.id, { type: "query-state" }).catch(() => {
+        });
+      }
+      void persistState();
+      broadcastSessions();
+    } catch (err) {
+      console.warn("[MediaControls Background] refreshTabsAndInject error:", err);
+    }
+  }
+  var readyPromise = (async () => {
+    await restoreState();
+    await refreshTabsAndInject();
+    const sessions = resolveSessions();
+    updateToolbarAction(sessions);
+  })();
+  browser.runtime.onMessage.addListener(
+    async (message, sender) => {
+      await readyPromise;
+      if (message && message.type === "frame-state") {
+        const tabId = sender.tab?.id;
+        const frameId = sender.frameId ?? 0;
+        if (!tabId) return;
+        if (!registry.has(tabId)) {
+          registry.set(tabId, /* @__PURE__ */ new Map());
+        }
+        const frameMap = registry.get(tabId);
+        if (message.state === null) {
+          frameMap.delete(frameId);
+          if (frameMap.size === 0) {
+            registry.delete(tabId);
+          }
+        } else {
+          frameMap.set(frameId, message.state);
+        }
+        if (sender.tab) {
+          const current = tabsInfo.get(tabId) || {
+            audible: false,
+            muted: false,
+            title: "",
+            favIconUrl: "",
+            url: ""
+          };
+          tabsInfo.set(tabId, {
+            ...current,
+            audible: sender.tab.audible ?? current.audible,
+            muted: sender.tab.mutedInfo?.muted ?? current.muted,
+            title: sender.tab.title ?? current.title,
+            favIconUrl: sender.tab.favIconUrl ?? current.favIconUrl,
+            url: sender.tab.url ?? current.url
+          });
+        }
+        persistState();
+        broadcastSessions();
+      }
+    }
+  );
+  browser.tabs.onCreated.addListener((tab) => {
+    if (typeof tab.id === "number") {
+      openTabIds.add(tab.id);
+    }
+  });
+  browser.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
+    await readyPromise;
+    openTabIds.add(tabId);
+    if (changeInfo.status === "loading" && changeInfo.url) {
+      registry.delete(tabId);
+    }
+    const newUrl = changeInfo.url || tab.url;
+    const prevUrl = tabsInfo.get(tabId)?.url;
+    if (prevUrl && newUrl && prevUrl !== newUrl) {
+      try {
+        const oldU = new URL(prevUrl);
+        const newU = new URL(newUrl);
+        if (oldU.pathname !== newU.pathname || oldU.searchParams.get("v") !== newU.searchParams.get("v")) {
+          registry.delete(tabId);
+        }
+      } catch (_) {
+        registry.delete(tabId);
+      }
+    }
+    const current = tabsInfo.get(tabId) || {
+      audible: false,
+      muted: false,
+      title: "",
+      favIconUrl: "",
+      url: ""
+    };
+    const isAudible = changeInfo.audible ?? tab.audible ?? current.audible;
+    tabsInfo.set(tabId, {
+      audible: isAudible,
+      muted: changeInfo.mutedInfo?.muted ?? tab.mutedInfo?.muted ?? current.muted,
+      title: changeInfo.title ?? tab.title ?? current.title,
+      favIconUrl: changeInfo.favIconUrl ?? tab.favIconUrl ?? current.favIconUrl,
+      url: changeInfo.url ?? tab.url ?? current.url
+    });
+    if (changeInfo.status === "complete" || changeInfo.audible === true || changeInfo.url) {
+      const hasFrames = registry.has(tabId) && (registry.get(tabId)?.size ?? 0) > 0;
+      if (!hasFrames) {
+        void injectScriptsIntoTab(tabId);
+      }
+      browser.tabs.sendMessage(tabId, { type: "query-state" }).catch(() => {
+      });
+    }
+    persistState();
+    broadcastSessions();
+  });
+  browser.tabs.onRemoved.addListener(async (tabId) => {
+    await readyPromise;
+    openTabIds.delete(tabId);
+    registry.delete(tabId);
+    tabsInfo.delete(tabId);
+    lastOrderedTabIds = lastOrderedTabIds.filter((id) => id !== tabId);
+    customTabOrder = customTabOrder.filter((id) => id !== tabId);
+    persistState();
+    broadcastSessions();
+  });
+  browser.runtime.onConnect.addListener((port) => {
+    if (port.name === "popup") {
+      connectedPopupPorts.add(port);
+      void readyPromise.then(() => {
+        port.postMessage({ type: "sessions", sessions: resolveSessions() });
+        void refreshTabsAndInject();
+      }).catch((err) => {
+        console.warn("[MediaControls Background] Popup startup failed:", err);
+        port.postMessage({ type: "sessions", sessions: resolveSessions() });
+      });
+      port.onMessage.addListener(async (rawMsg) => {
+        await readyPromise;
+        const msg = rawMsg;
+        if (msg.type === "cmd") {
+          const frameId = msg.frameId ?? 0;
+          const relayMsg = {
+            type: "cmd",
+            cmd: msg.cmd
+          };
+          let handled = false;
+          try {
+            handled = await browser.tabs.sendMessage(msg.tabId, relayMsg, { frameId }) === true;
+          } catch (err) {
+            console.warn("[MediaControls Background] Failed to send cmd to frame:", err);
+          }
+          if (!handled && frameId !== 0 && (msg.cmd.action === "nexttrack" || msg.cmd.action === "previoustrack")) {
+            browser.tabs.sendMessage(msg.tabId, relayMsg, { frameId: 0 }).catch(() => {
+            });
+          }
+        } else if (msg.type === "focus") {
+          try {
+            await browser.tabs.update(msg.tabId, { active: true });
+            const tab = await browser.tabs.get(msg.tabId);
+            if (tab.windowId) {
+              await browser.windows.update(tab.windowId, { focused: true });
+            }
+          } catch (err) {
+            console.warn("[MediaControls Background] Failed to focus tab:", err);
+          }
+        } else if (msg.type === "mute") {
+          try {
+            await browser.tabs.update(msg.tabId, { muted: msg.muted });
+          } catch (err) {
+            console.warn("[MediaControls Background] Failed to mute tab:", err);
+          }
+        } else if (msg.type === "reorder") {
+          lastOrderedTabIds = msg.tabIds;
+          customTabOrder = msg.tabIds;
+          persistState();
+          broadcastSessions();
+        } else if (msg.type === "request-sessions") {
+          await refreshTabsAndInject();
+          port.postMessage({
+            type: "sessions",
+            sessions: resolveSessions()
+          });
+        }
+      });
+      port.onDisconnect.addListener(() => {
+        connectedPopupPorts.delete(port);
+        lastOrderedTabIds = [];
+        persistState();
+      });
+    }
+  });
+  browser.runtime.onInstalled.addListener(async () => {
+    try {
+      const tabs = await browser.tabs.query({ url: ["http://*/*", "https://*/*"] });
+      for (const tab of tabs) {
+        if (tab.id) {
+          await injectScriptsIntoTab(tab.id);
+        }
+      }
+      await refreshTabsAndInject();
+      broadcastSessions();
+    } catch (err) {
+      console.warn("[MediaControls Background] Script injection on install failed:", err);
+    }
+  });
+  browser.permissions.onAdded.addListener(async (permissions) => {
+    if (!permissions.origins?.includes("<all_urls>")) return;
+    try {
+      const tabs = await browser.tabs.query({ url: ["http://*/*", "https://*/*"] });
+      await Promise.all(tabs.filter((tab) => tab.id !== void 0).map(
+        (tab) => injectScriptsIntoTab(tab.id)
+      ));
+      await refreshTabsAndInject();
+      broadcastSessions();
+    } catch (err) {
+      console.warn("[MediaControls Background] Injection after permission grant failed:", err);
+    }
+  });
+})();
+//# sourceMappingURL=background.js.map
