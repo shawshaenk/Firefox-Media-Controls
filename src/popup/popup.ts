@@ -39,6 +39,21 @@ interface CardDom {
   chapters: YouTubeChapter[];
   chaptersOpen: boolean;
   activeChapterIndex: number;
+  volumeBtn: HTMLButtonElement;
+  volumeSection: HTMLElement;
+  volumeMuteBtn: HTMLButtonElement;
+  volumeSlider: HTMLInputElement;
+  volumeLabel: HTMLElement;
+  volumeUnavailable: HTMLElement;
+  volumeOpen: boolean;
+  volumeDragging: boolean;
+  dragVolume: number | null;
+  pendingVolume: {
+    level: number;
+    expiresAt: number;
+  } | null;
+  lastVolumeSentAt: number;
+  volumeThrottleTimer: number | null;
 
   // State tracking
   session: Session;
@@ -422,8 +437,10 @@ function createCardDom(session: Session): CardDom {
     const target = e.target as HTMLElement;
     if (
       target.closest("button") ||
+      target.closest("input") ||
       target.closest(".slider-container") ||
       target.closest(".chapter-section") ||
+      target.closest(".volume-section") ||
       target.closest(".card-drag-handle")
     ) {
       return;
@@ -483,12 +500,30 @@ function createCardDom(session: Session): CardDom {
     e.stopPropagation();
     const videoId = cardDom.session.youtubeVideoId;
     if (!videoId) return;
-    setChaptersOpen(cardDom, !cardDom.chaptersOpen);
-    if (cardDom.chaptersOpen) {
+    const willOpen = !cardDom.chaptersOpen;
+    setChaptersOpen(cardDom, willOpen);
+    if (willOpen) {
+      setVolumeOpen(cardDom, false);
       if (cardDom.chapterVideoId !== videoId) {
         showChapterMessage(cardDom, "Loading chapters…");
       }
       port?.postMessage({ type: "chapters-request", tabId: cardDom.session.tabId } as PopupToBgMessage);
+    }
+  });
+
+  const volumeBtn = document.createElement("button");
+  volumeBtn.className = "card-volume-btn";
+  volumeBtn.type = "button";
+  volumeBtn.setAttribute("aria-label", "Show volume controls");
+  volumeBtn.setAttribute("aria-expanded", "false");
+  volumeBtn.title = "Show volume controls";
+  setIcon(volumeBtn, "volume_up");
+  volumeBtn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    const willOpen = !cardDom.volumeOpen;
+    setVolumeOpen(cardDom, willOpen);
+    if (willOpen) {
+      setChaptersOpen(cardDom, false);
     }
   });
 
@@ -778,11 +813,137 @@ function createCardDom(session: Session): CardDom {
   chapterSection.appendChild(chapterHeading);
   chapterSection.appendChild(chapterList);
 
+  const volumeSection = document.createElement("section");
+  volumeSection.className = "volume-section";
+  volumeSection.hidden = true;
+  volumeSection.id = `volume-${session.tabId}`;
+  volumeSection.setAttribute("aria-label", "Volume controls");
+  volumeBtn.setAttribute("aria-controls", volumeSection.id);
+
+  const volumeMuteBtn = document.createElement("button");
+  volumeMuteBtn.className = "volume-mute-btn";
+  volumeMuteBtn.type = "button";
+  volumeMuteBtn.setAttribute("aria-label", "Mute tab");
+  volumeMuteBtn.title = "Mute tab";
+  setIcon(volumeMuteBtn, "volume_up");
+  volumeMuteBtn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    sendMute(cardDom.session.tabId, !cardDom.session.muted);
+  });
+
+  const volumeSlider = document.createElement("input");
+  volumeSlider.className = "volume-slider";
+  volumeSlider.type = "range";
+  volumeSlider.min = "0";
+  volumeSlider.max = "100";
+  volumeSlider.step = "1";
+  volumeSlider.value = "100";
+  volumeSlider.style.setProperty("--volume-pct", "100%");
+  volumeSlider.setAttribute("aria-valuemin", "0");
+  volumeSlider.setAttribute("aria-valuemax", "100");
+
+  const volumeLabel = document.createElement("span");
+  volumeLabel.className = "volume-label";
+  volumeLabel.textContent = "100%";
+
+  const volumeUnavailable = document.createElement("div");
+  volumeUnavailable.className = "volume-unavailable";
+  volumeUnavailable.textContent = "Volume unavailable for this player";
+  volumeUnavailable.hidden = true;
+
+  volumeSection.appendChild(volumeMuteBtn);
+  volumeSection.appendChild(volumeSlider);
+  volumeSection.appendChild(volumeLabel);
+  volumeSection.appendChild(volumeUnavailable);
+
+  // Clicking or dragging inside the volume row must not focus the tab.
+  volumeSection.addEventListener("click", (e) => {
+    e.stopPropagation();
+  });
+  volumeSection.addEventListener("pointerdown", (e) => {
+    e.stopPropagation();
+  });
+  volumeSection.addEventListener("mousedown", (e) => {
+    e.stopPropagation();
+  });
+  volumeSection.addEventListener("pointerup", (e) => {
+    e.stopPropagation();
+  });
+
+  volumeSlider.addEventListener("pointerdown", (e) => {
+    e.stopPropagation();
+    cardDom.volumeDragging = true;
+  });
+
+  volumeSlider.addEventListener("input", () => {
+    const pct = Math.max(0, Math.min(100, Number(volumeSlider.value) || 0));
+    const level = pct / 100;
+    cardDom.dragVolume = level;
+    cardDom.volumeDragging = true;
+    paintVolumeSlider(volumeSlider, volumeLabel, pct);
+    const now = Date.now();
+    if (now - cardDom.lastVolumeSentAt >= 80) {
+      cardDom.lastVolumeSentAt = now;
+      sendVolumeLevel(cardDom, level);
+    } else if (cardDom.volumeThrottleTimer === null) {
+      cardDom.volumeThrottleTimer = window.setTimeout(() => {
+        cardDom.volumeThrottleTimer = null;
+        const pending = cardDom.dragVolume;
+        if (pending === null) return;
+        cardDom.lastVolumeSentAt = Date.now();
+        sendVolumeLevel(cardDom, pending);
+      }, 80);
+    }
+  });
+
+  const commitVolumeSlider = () => {
+    if (cardDom.volumeThrottleTimer !== null) {
+      window.clearTimeout(cardDom.volumeThrottleTimer);
+      cardDom.volumeThrottleTimer = null;
+    }
+    const pct = Math.max(0, Math.min(100, Number(volumeSlider.value) || 0));
+    const level = pct / 100;
+    cardDom.lastVolumeSentAt = Date.now();
+    sendVolumeLevel(cardDom, level);
+    cardDom.pendingVolume = { level, expiresAt: Date.now() + 2000 };
+    cardDom.dragVolume = null;
+    cardDom.volumeDragging = false;
+    paintVolumeSlider(volumeSlider, volumeLabel, pct);
+  };
+  volumeSlider.addEventListener("change", (e) => {
+    e.stopPropagation();
+    commitVolumeSlider();
+  });
+  volumeSlider.addEventListener("pointerup", (e) => {
+    e.stopPropagation();
+  });
+  volumeSlider.addEventListener("pointercancel", (e) => {
+    e.stopPropagation();
+    cardDom.volumeDragging = false;
+    cardDom.dragVolume = null;
+  });
+  volumeSlider.addEventListener("blur", () => {
+    cardDom.volumeDragging = false;
+    if (cardDom.dragVolume !== null && cardDom.pendingVolume === null) {
+      cardDom.dragVolume = null;
+    }
+  });
+  volumeSlider.addEventListener("keydown", (e) => {
+    // Let the native range input handle arrows/page/home/end, but keep the
+    // card from interpreting them as reorder shortcuts.
+    e.stopPropagation();
+  });
+  volumeSlider.addEventListener("keyup", (e) => {
+    e.stopPropagation();
+  });
+
+  cardEl.appendChild(volumeBtn);
   cardEl.appendChild(chapterBtn);
   cardEl.appendChild(pinBtn);
   cardEl.appendChild(dragHandle);
   cardEl.appendChild(topRowEl);
   cardEl.appendChild(bottomRowEl);
+  cardEl.appendChild(volumeSection);
   cardEl.appendChild(chapterSection);
 
   const cardDom: CardDom = {
@@ -814,6 +975,18 @@ function createCardDom(session: Session): CardDom {
     chapters: [],
     chaptersOpen: false,
     activeChapterIndex: -1,
+    volumeBtn,
+    volumeSection,
+    volumeMuteBtn,
+    volumeSlider,
+    volumeLabel,
+    volumeUnavailable,
+    volumeOpen: false,
+    volumeDragging: false,
+    dragVolume: null,
+    pendingVolume: null,
+    lastVolumeSentAt: 0,
+    volumeThrottleTimer: null,
     session,
     isDragging: false,
     dragPct: 0,
@@ -823,6 +996,78 @@ function createCardDom(session: Session): CardDom {
   };
 
   return cardDom;
+}
+
+function sendVolumeLevel(card: CardDom, level: number) {
+  const clamped = Math.min(1, Math.max(0, level));
+  if (!Number.isFinite(clamped)) return;
+  sendCommand(card.session.tabId, card.session.frameId, {
+    action: "setvolume",
+    volume: clamped
+  });
+}
+
+function paintVolumeSlider(slider: HTMLInputElement, label: HTMLElement, pct: number) {
+  const rounded = Math.round(Math.max(0, Math.min(100, pct)));
+  slider.value = String(rounded);
+  slider.setAttribute("aria-valuenow", String(rounded));
+  slider.setAttribute("aria-valuetext", `${rounded} percent`);
+  slider.style.setProperty("--volume-pct", `${rounded}%`);
+  label.textContent = `${rounded}%`;
+}
+
+function setVolumeOpen(card: CardDom, open: boolean) {
+  card.volumeOpen = open;
+  card.volumeSection.hidden = !open;
+  card.volumeBtn.classList.toggle("is-open", open);
+  card.volumeBtn.setAttribute("aria-expanded", String(open));
+  card.volumeBtn.setAttribute("aria-label", open ? "Hide volume controls" : "Show volume controls");
+  card.volumeBtn.title = open ? "Hide volume controls" : "Show volume controls";
+}
+
+function updateVolumeUI(card: CardDom) {
+  const session = card.session;
+  const muted = Boolean(session.muted);
+  setIcon(card.volumeMuteBtn, muted ? "volume_off" : "volume_up");
+  card.volumeMuteBtn.setAttribute("aria-label", muted ? "Unmute tab" : "Mute tab");
+  card.volumeMuteBtn.title = muted ? "Unmute tab" : "Mute tab";
+
+  const title = session.state?.metadata?.title || session.tabTitle || session.hostname || "this tab";
+  card.volumeSlider.setAttribute("aria-label", `Volume for ${title}`);
+  card.volumeMuteBtn.setAttribute("aria-label", muted ? `Unmute tab for ${title}` : `Mute tab for ${title}`);
+
+  const vol = session.state?.volume ?? null;
+  if (!vol) {
+    card.volumeSlider.style.display = "none";
+    card.volumeLabel.style.display = "none";
+    card.volumeUnavailable.hidden = false;
+    card.volumeSlider.disabled = true;
+    return;
+  }
+  card.volumeSlider.disabled = false;
+  card.volumeSlider.style.display = "";
+  card.volumeLabel.style.display = "";
+  card.volumeUnavailable.hidden = true;
+
+  const now = Date.now();
+  if (card.pendingVolume && now >= card.pendingVolume.expiresAt) {
+    card.pendingVolume = null;
+  }
+  // Preserve the locally dragged value until the page reports the new level.
+  if (card.volumeDragging && card.dragVolume !== null) {
+    return;
+  }
+  if (card.pendingVolume) {
+    if (Math.abs(vol.level - card.pendingVolume.level) <= 0.02) {
+      card.pendingVolume = null;
+    } else {
+      paintVolumeSlider(card.volumeSlider, card.volumeLabel, card.pendingVolume.level * 100);
+      return;
+    }
+  }
+  // Do not make the thumb jump backward while the user has focus on the slider;
+  // the pending/drag guards above already cover the active interaction.
+  paintVolumeSlider(card.volumeSlider, card.volumeLabel, Math.min(1, Math.max(0, vol.level)) * 100);
 }
 
 function setChaptersOpen(card: CardDom, open: boolean) {
@@ -1018,6 +1263,8 @@ function updateCardDom(card: CardDom, session: Session) {
   card.pinBtn.title = session.pinned ? "Unpin card" : "Pin card to top";
   card.chapterBtn.hidden = !session.youtubeVideoId || session.degraded;
   if (card.chapterBtn.hidden && card.chaptersOpen) setChaptersOpen(card, false);
+  card.volumeSection.id = `volume-${session.tabId}`;
+  card.volumeBtn.setAttribute("aria-controls", card.volumeSection.id);
 
   // 1. Text column
   const hostname = session.hostname || "browser";
@@ -1070,6 +1317,9 @@ function updateCardDom(card: CardDom, session: Session) {
 
   // 3. Play button
   updatePlayButton(card);
+
+  // Volume row (kept stable; works for degraded/Web Audio via tab mute).
+  updateVolumeUI(card);
 
   // 4. Degraded vs Full Controls
   if (session.degraded) {
@@ -1284,6 +1534,7 @@ async function initPopup() {
         ],
         isLive: false,
         seekable: true,
+        volume: { level: 0.7, mediaMuted: false },
         lastPlayedAt: Date.now()
       },
       audible: true,
@@ -1316,6 +1567,7 @@ async function initPopup() {
         actions: ["play", "pause", "previoustrack", "nexttrack", "seekto"],
         isLive: false,
         seekable: true,
+        volume: { level: 0.35, mediaMuted: false },
         lastPlayedAt: Date.now() - 10000
       },
       audible: false,

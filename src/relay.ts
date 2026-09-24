@@ -5,6 +5,7 @@ import type {
   MediaArtwork,
   MediaMetadataState,
   PositionState,
+  VolumeState,
   McxDownMessage,
   McxUpMessage,
   RelayToBgMessage,
@@ -25,6 +26,7 @@ import type {
     "seekbackward",
     "seekforward",
     "seekto",
+    "setvolume",
     "stop"
   ]);
   const pendingCommands = new Map<number, (handled: boolean) => void>();
@@ -104,6 +106,16 @@ import type {
     };
   }
 
+  function sanitizeVolume(vol: any): VolumeState | null {
+    if (!vol || typeof vol !== "object") return null;
+    if (typeof vol.level !== "number" || !isFinite(vol.level)) return null;
+    const level = Math.min(1, Math.max(0, vol.level));
+    return {
+      level,
+      mediaMuted: vol.mediaMuted === true
+    };
+  }
+
   function sanitizeFrameState(state: any): FrameState | null {
     if (!state || typeof state !== "object") return null;
 
@@ -148,6 +160,7 @@ import type {
       actions,
       isLive,
       seekable,
+      volume: sanitizeVolume(state.volume),
       lastPlayedAt,
       playBlocked
     };
@@ -179,9 +192,30 @@ import type {
     });
   });
 
+  function sanitizeCommand(cmd: any): Command | null {
+    if (!cmd || typeof cmd !== "object" || typeof cmd.action !== "string") return null;
+    if (!ALLOWED_ACTIONS.has(cmd.action as Action)) return null;
+    const sanitized: Command = { action: cmd.action as Action };
+    if (typeof cmd.seekTime === "number" && isFinite(cmd.seekTime)) {
+      sanitized.seekTime = Math.max(0, cmd.seekTime);
+    }
+    if (typeof cmd.offset === "number" && isFinite(cmd.offset)) {
+      sanitized.offset = cmd.offset;
+    }
+    if (cmd.action === "setvolume") {
+      if (typeof cmd.volume !== "number" || !isFinite(cmd.volume)) return null;
+      sanitized.volume = Math.min(1, Math.max(0, cmd.volume));
+    } else if (typeof cmd.volume === "number" && isFinite(cmd.volume)) {
+      sanitized.volume = Math.min(1, Math.max(0, cmd.volume));
+    }
+    return sanitized;
+  }
+
   // Listen for commands and queries from background script
   browser.runtime.onMessage.addListener((message: any) => {
     if (message && message.type === "cmd" && message.cmd) {
+      const sanitized = sanitizeCommand(message.cmd);
+      if (!sanitized) return Promise.resolve(false);
       return new Promise<boolean>((resolve) => {
         const id = ++nextCommandId;
         const timeout = window.setTimeout(() => {
@@ -192,7 +226,7 @@ import type {
           clearTimeout(timeout);
           resolve(handled);
         });
-        window.postMessage({ __mcx: "down", id, cmd: message.cmd as Command } as McxDownMessage, "*");
+        window.postMessage({ __mcx: "down", id, cmd: sanitized } as McxDownMessage, "*");
       });
     } else if (message && message.type === "query-state") {
       const downMsg: McxDownMessage = {

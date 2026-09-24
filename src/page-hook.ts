@@ -4,6 +4,7 @@ import type {
   FrameState,
   MediaMetadataState,
   PositionState,
+  VolumeState,
   McxDownMessage,
   McxUpMessage
 } from "./shared/protocol";
@@ -777,6 +778,7 @@ import type {
         actions: Array.from(actionsSet),
         isLive,
         seekable: isSeekable,
+        volume: getPrimaryVolumeState(),
         lastPlayedAt: lastPlayedAtEpoch,
         playBlocked: autoplayBlocked
       });
@@ -834,6 +836,7 @@ import type {
         actions,
         isLive,
         seekable,
+        volume: getPrimaryVolumeState(),
         lastPlayedAt: lastPlayedAtEpoch,
         playBlocked: false
       });
@@ -887,6 +890,7 @@ import type {
         actions,
         isLive,
         seekable,
+        volume: getPrimaryVolumeState(),
         lastPlayedAt: lastPlayedAtEpoch,
         playBlocked: autoplayBlocked
       });
@@ -922,6 +926,7 @@ import type {
         actions: ["play", "pause", ...availableTrackActions()],
         isLive: true,
         seekable: false,
+        volume: null,
         lastPlayedAt: lastPlayedAtEpoch,
         playBlocked: autoplayBlocked
       });
@@ -949,6 +954,7 @@ import type {
           playbackRate: 0,
           updatedAt: Date.now()
         } : null,
+        volume: getPrimaryVolumeState() ?? previous.volume ?? null,
         actions: Array.from(new Set<Action>([
           ...(Object.keys(handlers) as Action[]).filter(
             (action) => action !== "previoustrack" && action !== "nexttrack"
@@ -1351,6 +1357,105 @@ import type {
     return false;
   }
 
+  function clampVolume01(value: unknown): number | null {
+    if (typeof value !== "number" || !isFinite(value)) return null;
+    if (value <= 0) return 0;
+    if (value >= 1) return 1;
+    return value;
+  }
+
+  function isYouTubeHost(): boolean {
+    try {
+      const host = window.location?.hostname?.toLowerCase() || "";
+      return host.includes("youtube.com") || host.includes("youtu.be");
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function getPrimaryElementForVolume(): HTMLMediaElement | null {
+    try {
+      if (activePrimaryElement && activePrimaryElement.isConnected &&
+          !isInlinePreviewElement(activePrimaryElement)) {
+        return activePrimaryElement;
+      }
+      const els = pruneAndGetElements().filter((el) => !isInlinePreviewElement(el));
+      return activePrimaryElement && !isInlinePreviewElement(activePrimaryElement)
+        ? activePrimaryElement
+        : els[0] || null;
+    } catch (_) {
+      return activePrimaryElement || null;
+    }
+  }
+
+  function getPrimaryVolumeState(): VolumeState | null {
+    try {
+      const el = getPrimaryElementForVolume();
+      if (isYouTubeHost()) {
+        try {
+          const yt = getYtPlayer();
+          if (yt && typeof yt.getVolume === "function") {
+            const raw = yt.getVolume();
+            if (typeof raw === "number" && isFinite(raw)) {
+              const level = clampVolume01(raw / 100);
+              if (level !== null) {
+                let mediaMuted = false;
+                try {
+                  if (typeof yt.isMuted === "function") {
+                    mediaMuted = Boolean(yt.isMuted());
+                  } else if (el) {
+                    mediaMuted = Boolean(el.muted);
+                  }
+                } catch (_) {
+                  mediaMuted = el ? Boolean(el.muted) : false;
+                }
+                // Keep the site volume UI in sync by trusting the player API
+                // when it reports a usable value.
+                return { level, mediaMuted };
+              }
+            }
+          }
+        } catch (_) {}
+      }
+      if (el) {
+        try {
+          const rawLevel = (el as HTMLMediaElement).volume;
+          const level = clampVolume01(rawLevel);
+          if (level === null) return null;
+          return { level, mediaMuted: Boolean((el as HTMLMediaElement).muted) };
+        } catch (_) {
+          return null;
+        }
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  function setPrimaryVolumeLevel(level01: number): boolean {
+    const level = clampVolume01(level01);
+    if (level === null) return false;
+    let handled = false;
+    // Never touch unrelated media elements: only the primary element for
+    // this card, plus the YouTube player API which drives that same player.
+    if (isYouTubeHost()) {
+      try {
+        const yt = getYtPlayer();
+        if (yt && typeof yt.setVolume === "function") {
+          yt.setVolume(Math.round(level * 100));
+          handled = true;
+        }
+      } catch (_) {}
+    }
+    try {
+      const el = getPrimaryElementForVolume();
+      if (el) {
+        el.volume = level;
+        handled = true;
+      }
+    } catch (_) {}
+    return handled;
+  }
+
   function tryPlayElement(el: HTMLMediaElement): boolean {
     let p: Promise<void> | undefined;
     try {
@@ -1672,6 +1777,15 @@ import type {
       }
 
       scheduleEvaluation();
+      return handled;
+    }
+
+    if (cmd.action === "setvolume") {
+      const level = clampVolume01(cmd.volume);
+      if (level === null) return false;
+      const handled = setPrimaryVolumeLevel(level);
+      scheduleEvaluation();
+      setTimeout(scheduleEvaluation, 150);
       return handled;
     }
 

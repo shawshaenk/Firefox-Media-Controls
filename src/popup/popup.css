@@ -185,7 +185,8 @@ scrollbar {
 }
 
 .card-pin-btn,
-.card-chapters-btn {
+.card-chapters-btn,
+.card-volume-btn {
   position: absolute;
   top: 10px;
   width: 24px;
@@ -205,8 +206,12 @@ scrollbar {
   right: 40px;
 }
 
-.card-chapters-btn {
+.card-volume-btn {
   right: 64px;
+}
+
+.card-chapters-btn {
+  right: 88px;
 }
 
 .card-chapters-btn[hidden] {
@@ -216,22 +221,27 @@ scrollbar {
 .card-pin-btn:hover,
 .card-pin-btn:focus-visible,
 .card-chapters-btn:hover,
-.card-chapters-btn:focus-visible {
+.card-chapters-btn:focus-visible,
+.card-volume-btn:hover,
+.card-volume-btn:focus-visible {
   background-color: var(--state-layer-hover);
 }
 
-.card-pin-btn.is-pinned {
+.card-pin-btn.is-pinned,
+.card-volume-btn.is-open {
   color: var(--slider-active);
 }
 
 .card-pin-btn:focus-visible,
-.card-chapters-btn:focus-visible {
+.card-chapters-btn:focus-visible,
+.card-volume-btn:focus-visible {
   outline: 2px solid var(--focus-ring);
   outline-offset: 1px;
 }
 
 .card-pin-btn svg,
-.card-chapters-btn svg {
+.card-chapters-btn svg,
+.card-volume-btn svg {
   width: 17px;
   height: 17px;
   pointer-events: none;
@@ -559,6 +569,152 @@ scrollbar {
   font-size: 13px;
   line-height: 18px;
   padding: 8px 6px 12px;
+}
+
+/* Volume dropdown expands immediately below the playback controls. */
+.volume-section {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--slider-inactive);
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 32px;
+}
+
+.volume-section[hidden] {
+  display: none;
+}
+
+.volume-mute-btn {
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  border: none;
+  background: transparent;
+  color: var(--control-icon);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  flex-shrink: 0;
+  position: relative;
+  outline: none;
+  transition: background-color 0.15s ease;
+}
+
+.volume-mute-btn:not(:disabled):hover::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  background-color: var(--state-layer-hover);
+}
+
+.volume-mute-btn:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+.volume-mute-btn svg {
+  width: 20px;
+  height: 20px;
+  pointer-events: none;
+}
+
+.volume-slider {
+  flex: 1;
+  min-width: 0;
+  height: 32px;
+  margin: 0 10px;
+  padding: 0;
+  background: transparent;
+  cursor: pointer;
+  -webkit-appearance: none;
+  appearance: none;
+  outline: none;
+}
+
+/* Firefox: active 4px bar + inactive 2px track, 4x18 thumb — same as seek slider */
+.volume-slider::-moz-range-track {
+  height: 2px;
+  border-radius: 1px;
+  background-color: var(--slider-inactive);
+}
+
+.volume-slider::-moz-range-progress {
+  height: 4px;
+  border-radius: 2px;
+  background-color: var(--slider-active);
+}
+
+.volume-slider::-moz-range-thumb {
+  width: 4px;
+  height: 18px;
+  border-radius: 2px;
+  background-color: var(--slider-thumb);
+  border: none;
+}
+
+.volume-slider::-moz-focus-outer {
+  border: none;
+}
+
+/* Chromium/WebKit fallback: same bar thumb, gradient-filled 4px track */
+.volume-slider::-webkit-slider-runnable-track {
+  height: 4px;
+  border-radius: 2px;
+  background:
+    linear-gradient(
+      to right,
+      var(--slider-active) 0 var(--volume-pct, 100%),
+      var(--slider-inactive) var(--volume-pct, 100%) 100%
+    );
+}
+
+.volume-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 4px;
+  height: 18px;
+  border-radius: 2px;
+  background-color: var(--slider-thumb);
+  border: none;
+  margin-top: -7px;
+}
+
+.volume-slider:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+.volume-slider:disabled {
+  opacity: 0.38;
+  cursor: default;
+}
+
+.volume-label {
+  color: var(--text-artist);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
+  min-width: 38px;
+  text-align: right;
+  line-height: 16px;
+}
+
+.volume-unavailable {
+  color: var(--text-artist);
+  font-size: 13px;
+  line-height: 18px;
+  flex: 1;
+  min-width: 0;
+}
+
+.volume-unavailable[hidden] {
+  display: none;
 }
 
 /* Material 3 Slider */

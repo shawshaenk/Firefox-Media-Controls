@@ -6,6 +6,7 @@ export type Action =
   | "seekbackward"
   | "seekforward"
   | "seekto"
+  | "setvolume"
   | "stop";
 
 export interface MediaArtwork {
@@ -28,6 +29,11 @@ export interface PositionState {
   updatedAt: number; // epoch ms
 }
 
+export interface VolumeState {
+  level: number; // 0 to 1
+  mediaMuted: boolean;
+}
+
 export interface FrameState {
   source: "mediasession" | "element" | "webaudio";
   metadata: MediaMetadataState | null;
@@ -36,6 +42,7 @@ export interface FrameState {
   actions: Action[]; // handlers the page registered + ones we can emulate
   isLive: boolean; // duration === Infinity or live stream
   seekable: boolean;
+  volume: VolumeState | null; // null when no safe numeric volume control
   lastPlayedAt: number; // epoch ms, for ordering
   playBlocked?: boolean; // true when Firefox denies script initiated playback
 }
@@ -44,6 +51,7 @@ export interface Command {
   action: Action;
   seekTime?: number;
   offset?: number;
+  volume?: number; // 0 to 1, for setvolume
 }
 
 export interface Session {

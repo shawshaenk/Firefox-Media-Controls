@@ -12,6 +12,7 @@
       "seekbackward",
       "seekforward",
       "seekto",
+      "setvolume",
       "stop"
     ]);
     const pendingCommands = /* @__PURE__ */ new Map();
@@ -62,6 +63,15 @@
         updatedAt
       };
     }
+    function sanitizeVolume(vol) {
+      if (!vol || typeof vol !== "object") return null;
+      if (typeof vol.level !== "number" || !isFinite(vol.level)) return null;
+      const level = Math.min(1, Math.max(0, vol.level));
+      return {
+        level,
+        mediaMuted: vol.mediaMuted === true
+      };
+    }
     function sanitizeFrameState(state) {
       if (!state || typeof state !== "object") return null;
       const source = state.source === "mediasession" || state.source === "element" || state.source === "webaudio" ? state.source : null;
@@ -87,6 +97,7 @@
         actions,
         isLive,
         seekable,
+        volume: sanitizeVolume(state.volume),
         lastPlayedAt,
         playBlocked
       };
@@ -112,8 +123,28 @@
       browser.runtime.sendMessage(msg).catch(() => {
       });
     });
+    function sanitizeCommand(cmd) {
+      if (!cmd || typeof cmd !== "object" || typeof cmd.action !== "string") return null;
+      if (!ALLOWED_ACTIONS.has(cmd.action)) return null;
+      const sanitized = { action: cmd.action };
+      if (typeof cmd.seekTime === "number" && isFinite(cmd.seekTime)) {
+        sanitized.seekTime = Math.max(0, cmd.seekTime);
+      }
+      if (typeof cmd.offset === "number" && isFinite(cmd.offset)) {
+        sanitized.offset = cmd.offset;
+      }
+      if (cmd.action === "setvolume") {
+        if (typeof cmd.volume !== "number" || !isFinite(cmd.volume)) return null;
+        sanitized.volume = Math.min(1, Math.max(0, cmd.volume));
+      } else if (typeof cmd.volume === "number" && isFinite(cmd.volume)) {
+        sanitized.volume = Math.min(1, Math.max(0, cmd.volume));
+      }
+      return sanitized;
+    }
     browser.runtime.onMessage.addListener((message) => {
       if (message && message.type === "cmd" && message.cmd) {
+        const sanitized = sanitizeCommand(message.cmd);
+        if (!sanitized) return Promise.resolve(false);
         return new Promise((resolve) => {
           const id = ++nextCommandId;
           const timeout = window.setTimeout(() => {
@@ -124,7 +155,7 @@
             clearTimeout(timeout);
             resolve(handled);
           });
-          window.postMessage({ __mcx: "down", id, cmd: message.cmd }, "*");
+          window.postMessage({ __mcx: "down", id, cmd: sanitized }, "*");
         });
       } else if (message && message.type === "query-state") {
         const downMsg = {
