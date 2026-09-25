@@ -1,6 +1,6 @@
 {
   "name": "firefox-media-controller",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Firefox Global Media Controls Extension",
   "scripts": {
     "package": "npm run build && python3 scripts/package.py",
