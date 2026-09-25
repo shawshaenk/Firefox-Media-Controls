@@ -2,6 +2,8 @@
 
 Media Controls brings a Chrome-style global media controls flyout to Firefox. Open it from the toolbar to see and control media across your tabs in one place.
 
+![Media Controls extension demo](dev/EXTENSION_DEMO.png)
+
 ## Features
 
 - **One card per media tab.** Keep track of multiple tabs playing or holding media, with the site name, page title, artist when available, and cover art or favicon.
