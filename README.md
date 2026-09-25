@@ -60,7 +60,7 @@ npm ci
 npm run package
 ```
 
-The Python requirements file pins **Pillow 12.3.0**. `npm ci` installs the exact JavaScript dependency versions in `package-lock.json`, including esbuild and TypeScript. `npm run package` generates the six toolbar PNGs, copies the popup HTML and CSS, bundles the TypeScript entry points, and creates `dist/media-controls-1.0.1.xpi` using `scripts/package.py`. The XPI contains only the runtime files listed in that packaging script. Source maps are generated for local development but are not included in the XPI.
+The Python requirements file pins **Pillow 12.3.0**. `npm ci` installs the exact JavaScript dependency versions in `package-lock.json`, including esbuild and TypeScript. `npm run package` generates the toolbar PNGs at 16, 32, 48, 64, and 128 pixels, copies the popup HTML and CSS, bundles the TypeScript entry points, and creates `dist/media-controls-1.0.1.xpi` using `scripts/package.py`. The XPI contains only the runtime files listed in that packaging script. Source maps are generated for local development but are not included in the XPI.
 
 ## Build and development
 

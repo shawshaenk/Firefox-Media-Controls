@@ -878,7 +878,9 @@
       path: {
         "16": `${iconPrefix}-16.png`,
         "32": `${iconPrefix}-32.png`,
-        "48": `${iconPrefix}-48.png`
+        "48": `${iconPrefix}-48.png`,
+        "64": `${iconPrefix}-64.png`,
+        "128": `${iconPrefix}-128.png`
       }
     }).catch(() => {
     });
