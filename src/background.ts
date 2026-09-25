@@ -1061,6 +1061,7 @@ browser.runtime.onMessage.addListener(
         registry.set(tabId, new Map());
       }
       const frameMap = registry.get(tabId)!;
+      const wasBuffering = frameMap.get(frameId)?.buffering === true;
 
       if (message.state === null) {
         frameMap.delete(frameId);
@@ -1092,7 +1093,17 @@ browser.runtime.onMessage.addListener(
         noteYouTubeVideo(tabId, sender.tab.url ?? current.url);
       }
 
-      scheduleFrameUpdates();
+      if (wasBuffering !== (state?.buffering === true)) {
+        if (frameUpdateTimer !== null) {
+          clearTimeout(frameUpdateTimer);
+          frameUpdateTimer = null;
+        }
+        lastFrameUpdate = performance.now();
+        void persistState();
+        broadcastSessions();
+      } else {
+        scheduleFrameUpdates();
+      }
     }
   }
 );

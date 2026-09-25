@@ -1254,9 +1254,9 @@ function updatePlayButton(card: CardDom) {
   card.playBtn.classList.toggle("is-buffering", buffering);
   if (buffering) {
     card.playBtn.disabled = true;
-    card.playBtn.setAttribute("aria-label", "Video buffering");
+    card.playBtn.setAttribute("aria-label", "Media buffering");
     card.playBtn.setAttribute("aria-busy", "true");
-    card.playBtn.title = "Video is buffering";
+    card.playBtn.title = "Media is buffering";
   } else if (blocked && !isPlaying) {
     card.playBtn.removeAttribute("aria-busy");
     // The page has not played yet and Firefox forbids script initiated play.

@@ -68,3 +68,45 @@ test('floods are coalesced and the final paused state arrives; command replies b
   send({ __mcx: 'up', state: null });
   assert.equal(sent.at(-1).state, null);
 });
+
+test('buffering observer overrides legacy frame reports and recovers without a new media report', () => {
+  let now = 0;
+  let nextId = 0;
+  const timers = new Map();
+  const listeners = new Map();
+  const sent = [];
+  const window = {
+    addEventListener: (name, fn) => listeners.set(name, fn),
+    postMessage: () => {},
+    setTimeout: (fn, ms) => { timers.set(++nextId, { fn, at: now + ms }); return nextId; }
+  };
+  const browser = { runtime: { sendMessage: async message => sent.push(message), onMessage: { addListener: () => {} } } };
+  vm.runInNewContext(bundle('src/relay.ts'), {
+    window, browser, URL, performance: { now: () => now }, clearTimeout: id => timers.delete(id)
+  });
+  const send = data => listeners.get('message')({ source: window, data });
+  const tick = () => {
+    now += 100;
+    for (const [id, timer] of timers) {
+      if (timer.at <= now) { timers.delete(id); timer.fn(); }
+    }
+  };
+  send({ __mcx: 'up', state: { ...state(), buffering: false } });
+  send({ __mcx: 'buffering-state', buffering: true });
+  assert.equal(sent.at(-1).state.buffering, true);
+  // An older hook left in an open tab keeps sending its obsolete false flag.
+  send({ __mcx: 'up', state: { ...state(), buffering: false } });
+  tick();
+  assert.equal(sent.at(-1).state.buffering, true);
+  send({ __mcx: 'buffering-state', buffering: 'false' });
+  tick();
+  assert.equal(sent.at(-1).state.buffering, true, 'invalid signals must be ignored');
+  send({ __mcx: 'buffering-state', buffering: false });
+  tick();
+  assert.equal(sent.at(-1).state.buffering, false);
+  send({ __mcx: 'up', state: null });
+  tick();
+  send({ __mcx: 'buffering-state', buffering: true });
+  tick();
+  assert.equal(sent.at(-1).state, null, 'observer must not resurrect a removed card');
+});

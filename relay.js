@@ -130,6 +130,22 @@
     let pendingState;
     let stateTimer = null;
     let lastSentAt = -Infinity;
+    let lastSentBuffering = false;
+    let observedBuffering;
+    let latestFrame = null;
+    function queueState(state) {
+      const updated = state && observedBuffering !== void 0 ? { ...state, buffering: observedBuffering && !state.playBlocked } : state;
+      pendingState = updated;
+      if (updated?.buffering === true && !lastSentBuffering) {
+        if (stateTimer !== null) clearTimeout(stateTimer);
+        flushState();
+        return;
+      }
+      if (stateTimer !== null) return;
+      const wait = Math.max(0, 100 - (performance.now() - lastSentAt));
+      if (wait === 0) flushState();
+      else stateTimer = window.setTimeout(flushState, wait);
+    }
     function flushState() {
       stateTimer = null;
       const raw = pendingState;
@@ -137,6 +153,7 @@
       const state = sanitizeFrameState(raw);
       if (raw !== null && state === null) return;
       lastSentAt = performance.now();
+      lastSentBuffering = state?.buffering === true;
       browser.runtime.sendMessage({ type: "frame-state", state }).catch(() => {
       });
     }
@@ -152,16 +169,22 @@
         }
         return;
       }
+      if (data.__mcx === "buffering-state") {
+        if (typeof data.buffering !== "boolean") return;
+        observedBuffering = data.buffering;
+        if (latestFrame) queueState(latestFrame);
+        return;
+      }
       if (data.__mcx !== "up") return;
-      pendingState = data.state;
-      if (stateTimer !== null) return;
-      const wait = Math.max(0, 100 - (performance.now() - lastSentAt));
-      if (wait === 0) flushState();
-      else stateTimer = window.setTimeout(flushState, wait);
+      const clean = sanitizeFrameState(data.state);
+      if (data.state !== null && clean === null) return;
+      latestFrame = clean;
+      queueState(clean);
     });
     window.addEventListener("pagehide", (event) => {
       if (!event.isTrusted) return;
       if (stateTimer !== null) clearTimeout(stateTimer);
+      latestFrame = null;
       pendingState = null;
       flushState();
     });

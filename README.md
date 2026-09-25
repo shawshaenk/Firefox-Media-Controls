@@ -13,6 +13,7 @@ Chrome Media Controls brings Chrome's global media controls flyout to Firefox. O
 - **Per-card volume.** Open the volume menu on a card to adjust that tab's volume with a 0–100% slider and percentage label. Each card controls only its own tab; YouTube cards use the player volume so the site and flyout stay in sync. The row also has a mute/unmute button for the tab. Muting preserves the slider level, and moving the slider while muted changes the stored level without unmuting. Web Audio and restricted-player cards show tab mute with a “Volume unavailable for this player” note instead of a slider.
 - **YouTube chapters.** Open the chapter menu on a YouTube video card to jump to a chapter. The list scrolls within the card and automatically scrolls to the chapter currently playing.
 - **Autoplay feedback.** Firefox's autoplay policy still applies. If Firefox blocks extension playback, the Play button and seek skip buttons are disabled until playback is started from the page.
+- **Buffering feedback.** The play/pause button shows a spinning indicator and temporarily disables itself while an audio or video element is waiting for data, including media in frames, shadow DOM, and detached audio elements.
 - **Fallback for restricted tabs.** When Firefox reports a tab as audible but the extension cannot access its page, a simplified card lets you mute or unmute that tab.
 - **Pin and reorder cards.** Pin important cards to keep them above the rest, then drag cards to arrange their order. The order of pinned cards is saved across flyout and browser restarts.
 - **Tab count badge.** The toolbar badge shows how many cards are being tracked, including paused sessions; it is not limited to tabs currently producing sound.
@@ -38,21 +39,21 @@ Build the XPI, then load it as a temporary add-on:
 2. Install the Python dependency and run `npm ci` as shown below.
 3. Run `npm run package`.
 4. In Firefox, open `about:debugging#/runtime/this-firefox`.
-5. Choose **Load Temporary Add-on** and select the XPI in `dist` (currently `dist/media-controls-1.0.2.xpi`).
+5. Choose **Load Temporary Add-on** and select the XPI in `dist` (currently `dist/media-controls-1.0.3.xpi`).
 
 Temporary add-ons must be loaded again after restarting Firefox. This locally built XPI is not signed for permanent installation from the Add-ons Manager.
 
 ## Build from source for Mozilla reviewers
 
-The source archive for submission is `media-controls-source-1.0.2.zip`. It contains the original TypeScript, HTML, CSS, manifest, build scripts, lockfile, and icon generator. It excludes generated JavaScript, copied popup files, generated PNG icons, dependencies, and the XPI. The build produces the same add-on files as the submitted XPI.
+The source archive for submission is `media-controls-source-1.0.3.zip`. It contains the original TypeScript, HTML, CSS, manifest, build scripts, lockfile, and icon generator. It excludes generated JavaScript, copied popup files, generated PNG icons, dependencies, and the XPI. The build produces the same add-on files as the submitted XPI.
 
 The build was made on **Fedora Linux 44, x86_64**. Install **Node.js 24.18.0** from the Node.js distribution or a Node version manager, then install **npm 11.16.0** with `npm install -g npm@11.16.0`. Install **Python 3.14.7** with `pip` and `venv` from the Python distribution or your OS package manager. Confirm the installed versions with `node --version`, `npm --version`, and `python3 --version`. Internet access is needed for the dependency installation. No browser is needed to build the XPI.
 
 Extract the source archive, then run these commands from the directory containing the archive:
 
 ```sh
-unzip media-controls-source-1.0.2.zip
-cd media-controls-source-1.0.2
+unzip media-controls-source-1.0.3.zip
+cd media-controls-source-1.0.3
 python3 -m venv .venv
 . .venv/bin/activate
 python3 -m pip install -r requirements-build.txt
@@ -60,7 +61,7 @@ npm ci
 npm run package
 ```
 
-The Python requirements file pins **Pillow 12.3.0**. `npm ci` installs the exact JavaScript dependency versions in `package-lock.json`, including esbuild and TypeScript. `npm run package` generates the toolbar PNGs at 16, 32, 48, 64, and 128 pixels, copies the popup HTML and CSS, bundles the TypeScript entry points, and creates `dist/media-controls-1.0.2.xpi` using `scripts/package.py`. The XPI contains only the runtime files listed in that packaging script. Source maps are generated for local development but are not included in the XPI.
+The Python requirements file pins **Pillow 12.3.0**. `npm ci` installs the exact JavaScript dependency versions in `package-lock.json`, including esbuild and TypeScript. `npm run package` generates the toolbar PNGs at 16, 32, 48, 64, and 128 pixels, copies the popup HTML and CSS, bundles the TypeScript entry points, and creates `dist/media-controls-1.0.3.xpi` using `scripts/package.py`. The XPI contains only the runtime files listed in that packaging script. Source maps are generated for local development but are not included in the XPI.
 
 ## Build and development
 

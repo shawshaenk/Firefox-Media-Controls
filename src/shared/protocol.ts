@@ -45,7 +45,7 @@ export interface FrameState {
   volume: VolumeState | null; // null when no safe numeric volume control
   lastPlayedAt: number; // epoch ms, for ordering
   playBlocked?: boolean; // true when Firefox denies script initiated playback
-  buffering?: boolean; // true while a previously playing video waits for data
+  buffering?: boolean; // true while the active media element waits for data
 }
 
 export interface Command {
@@ -87,6 +87,7 @@ export interface ChapterState {
 // MAIN -> relay: { __mcx: "up", state: FrameState | null }
 export type McxUpMessage =
   | { __mcx: "up"; state: FrameState | null }
+  | { __mcx: "buffering-state"; buffering: boolean }
   | { __mcx: "command-result"; id: number; handled: boolean };
 
 // relay -> MAIN: { __mcx: "down", cmd?: Command, type?: "query-state" }

@@ -1,3 +1,4 @@
+import { installBufferingObserver } from "./buffering";
 import type {
   Action,
   Command,
@@ -10,6 +11,7 @@ import type {
 } from "./shared/protocol";
 
 (() => {
+  try { installBufferingObserver(); } catch (_) {}
   if ((window as any).__mcx_hook_installed) {
     try {
       window.postMessage({ __mcx: "down", type: "query-state" } as McxDownMessage, "*");
@@ -44,10 +46,11 @@ import type {
   let hasEverPlayedMediaSession = false;
 
   const trackedElements = new Set<WeakRef<HTMLMediaElement>>();
+  const observedElements = new WeakSet<HTMLMediaElement>();
+  const handledMediaEvents = new WeakSet<Event>();
   const trackedAudioContexts = new Set<WeakRef<AudioContext>>();
   const suspendedByUs = new WeakSet<AudioContext>();
   const elementsPlayedWithAudio = new WeakSet<HTMLMediaElement>();
-  const waitingForData = new WeakSet<HTMLMediaElement>();
   const pausedByUs = new Set<WeakRef<HTMLMediaElement>>();
 
   let lastPausedElement: WeakRef<HTMLMediaElement> | null = null;
@@ -59,7 +62,6 @@ import type {
   let currentFrameState: FrameState | null = null;
 
   let evalTimer: number | null = null;
-  let bufferingPollTimer: number | null = null;
   let lastKnownHref = typeof window !== "undefined" && window.location ? window.location.href : "";
   // Cold-play intent: popup asked for play while the YouTube player was still
   // cueing (autoplay off, fresh tab). Retry briefly as the player appears.
@@ -443,6 +445,13 @@ import type {
   function registerElement(el: HTMLMediaElement) {
     if (!el || !(el instanceof HTMLMediaElement)) return;
     if (isInlinePreviewElement(el)) return;
+    // Document and shadow-root listeners cannot observe detached new Audio() elements.
+    if (!observedElements.has(el)) {
+      observedElements.add(el);
+      for (const ev of MEDIA_EVENTS) {
+        el.addEventListener(ev, handleMediaEvent, true);
+      }
+    }
     for (const ref of trackedElements) {
       if (ref.deref() === el) return;
     }
@@ -494,17 +503,6 @@ import type {
 
   function postState(state: FrameState | null) {
     currentFrameState = state;
-    if (state?.buffering) {
-      if (bufferingPollTimer === null) {
-        bufferingPollTimer = window.setTimeout(() => {
-          bufferingPollTimer = null;
-          scheduleEvaluation();
-        }, 300);
-      }
-    } else if (bufferingPollTimer !== null) {
-      clearTimeout(bufferingPollTimer);
-      bufferingPollTimer = null;
-    }
     const msg: McxUpMessage = {
       __mcx: "up",
       state
@@ -547,18 +545,6 @@ import type {
     );
 
     const ytVideoId = isYouTube ? getYouTubeVideoId() : null;
-    const ytMedia = audiblePlaying[0] || playingElements[0] || activePrimaryElement || elements[0];
-    let ytPlayerBuffering = false;
-    if (isYouTube) {
-      try { ytPlayerBuffering = getYtPlayer()?.getPlayerState?.() === 3; } catch (_) {}
-    }
-    const buffering = Boolean(
-      isYouTube && ytVideoId && !autoplayBlocked &&
-      (hasConfirmedPlayback || hadTrustedGesture) &&
-      (ytPlayerBuffering || (ytMedia && !ytMedia.ended &&
-        (ytMedia.seeking || waitingForData.has(ytMedia))))
-    );
-
     // RULE 1 (YouTube Non-Watch Pages):
     // On YouTube non-watch pages (Home, Search, Subscriptions, Channel feeds, etc.),
     // NEVER emit a media card unless an element is actively playing audible audio!
@@ -808,7 +794,6 @@ import type {
         volume: getPrimaryVolumeState(),
         lastPlayedAt: lastPlayedAtEpoch,
         playBlocked: autoplayBlocked,
-        buffering
       });
       return;
     }
@@ -867,7 +852,6 @@ import type {
         volume: getPrimaryVolumeState(),
         lastPlayedAt: lastPlayedAtEpoch,
         playBlocked: false,
-        buffering
       });
       return;
     }
@@ -922,7 +906,6 @@ import type {
         volume: getPrimaryVolumeState(),
         lastPlayedAt: lastPlayedAtEpoch,
         playBlocked: autoplayBlocked,
-        buffering
       });
       return;
     }
@@ -979,7 +962,6 @@ import type {
         ...previous,
         playbackState: "paused",
         playBlocked: autoplayBlocked,
-        buffering: false,
         position: previous.position ? {
           ...previous.position,
           playbackRate: 0,
@@ -2064,21 +2046,15 @@ import type {
   } catch (_) {}
 
   // Capture listeners on document and window
-  const handleMediaEvent = (e: Event) => {
+  function handleMediaEvent(e: Event) {
+    if (handledMediaEvents.has(e)) return;
+    handledMediaEvents.add(e);
     const target = e.target;
     if (target && target instanceof HTMLMediaElement) {
       if (isInlinePreviewElement(target)) return;
       registerElement(target);
 
       const hasAudio = !target.muted && target.volume > 0;
-      if (e.type === "waiting" && !target.paused) {
-        waitingForData.add(target);
-      } else if (e.type === "playing" || e.type === "canplay" ||
-                 e.type === "canplaythrough" || e.type === "pause" ||
-                 e.type === "ended" || e.type === "emptied" ||
-                 (e.type === "seeked" && target.readyState >= 3)) {
-        waitingForData.delete(target);
-      }
       if (e.type === "playing") {
         pendingColdPlayUntil = 0;
         if (hasAudio || hadTrustedGesture) {
@@ -2113,7 +2089,7 @@ import type {
       }
       scheduleEvaluation();
     }
-  };
+  }
 
   for (const ev of MEDIA_EVENTS) {
     document.addEventListener(ev, handleMediaEvent, true);

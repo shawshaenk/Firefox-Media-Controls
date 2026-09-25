@@ -1,7 +1,154 @@
 "use strict";
 (() => {
+  // src/buffering.ts
+  function installBufferingObserver() {
+    const key = "__mcx_buffering_observer_v1";
+    const page = window;
+    if (typeof page[key] === "function") {
+      page[key]();
+      return;
+    }
+    const elements = /* @__PURE__ */ new Set();
+    const observed = /* @__PURE__ */ new WeakSet();
+    const waiting = /* @__PURE__ */ new WeakSet();
+    const roots = /* @__PURE__ */ new WeakSet();
+    const events = [
+      "play",
+      "playing",
+      "waiting",
+      "seeking",
+      "seeked",
+      "pause",
+      "ended",
+      "emptied",
+      "canplay",
+      "canplaythrough",
+      "error"
+    ];
+    let latest = null;
+    let lastSent;
+    let timer = null;
+    let hidden = false;
+    function track(el) {
+      if (observed.has(el)) return;
+      observed.add(el);
+      elements.add(new WeakRef(el));
+      for (const name of events) el.addEventListener(name, onMediaEvent);
+    }
+    function discover(root) {
+      for (const el of root.querySelectorAll("audio,video")) track(el);
+      for (const el of root.querySelectorAll("*")) {
+        if (el.shadowRoot) watchRoot(el.shadowRoot);
+      }
+    }
+    function watchRoot(root) {
+      if (roots.has(root)) return;
+      roots.add(root);
+      for (const name of events) root.addEventListener(name, onMediaEvent, true);
+      discover(root);
+    }
+    function onMediaEvent(event) {
+      const el = event.target;
+      if (!(el instanceof HTMLMediaElement)) return;
+      track(el);
+      if (event.type === "waiting") waiting.add(el);
+      if (["playing", "pause", "ended", "emptied", "canplay", "canplaythrough", "error"].includes(event.type) || event.type === "seeked" && el.readyState >= 3) waiting.delete(el);
+      if (["play", "playing", "waiting", "seeking"].includes(event.type)) latest = el;
+      publish();
+    }
+    function publish(force = false) {
+      if (hidden) return;
+      const candidates = [];
+      for (const ref of elements) {
+        const el = ref.deref();
+        if (!el) {
+          elements.delete(ref);
+          continue;
+        }
+        if (el.closest(".inline-preview-player, #inline-preview-player, ytd-video-preview, ytd-thumbnail")) continue;
+        candidates.push(el);
+      }
+      const playing = candidates.filter((el) => !el.paused && !el.ended);
+      const audible = playing.filter((el) => !el.muted && el.volume > 0);
+      if (!navigator.mediaSession?.metadata) {
+        audible.sort((a, b) => (Number.isFinite(b.duration) ? b.duration : 0) - (Number.isFinite(a.duration) ? a.duration : 0));
+      }
+      const primary = audible[0] || playing[0] || (latest && candidates.includes(latest) ? latest : candidates[0]);
+      let buffering = Boolean(primary && !primary.ended && !primary.error && (primary.seeking || waiting.has(primary) || !primary.paused && primary.readyState < 3));
+      if (location.hostname === "www.youtube.com" || location.hostname === "music.youtube.com" || location.hostname === "youtube.com") {
+        try {
+          const player = document.getElementById("movie_player");
+          buffering ||= player?.getPlayerState?.() === 3;
+        } catch (_) {
+        }
+      }
+      if (force || buffering !== lastSent) {
+        lastSent = buffering;
+        window.postMessage({ __mcx: "buffering-state", buffering }, "*");
+      }
+      if (timer === null && (candidates.length || document.getElementById("movie_player"))) {
+        timer = window.setTimeout(() => {
+          timer = null;
+          publish();
+        }, 200);
+      }
+    }
+    try {
+      const originalPlay = HTMLMediaElement.prototype.play;
+      HTMLMediaElement.prototype.play = function() {
+        try {
+          track(this);
+        } catch (_) {
+        }
+        return originalPlay.call(this);
+      };
+    } catch (_) {
+    }
+    try {
+      const originalAttachShadow = Element.prototype.attachShadow;
+      Element.prototype.attachShadow = function(init) {
+        const root = originalAttachShadow.call(this, init);
+        try {
+          watchRoot(root);
+        } catch (_) {
+        }
+        return root;
+      };
+    } catch (_) {
+    }
+    page[key] = () => publish(true);
+    watchRoot(document);
+    let scanTimer = null;
+    new MutationObserver(() => {
+      if (scanTimer !== null) return;
+      scanTimer = window.setTimeout(() => {
+        scanTimer = null;
+        discover(document);
+        publish();
+      }, 100);
+    }).observe(document, { childList: true, subtree: true });
+    window.addEventListener("message", (event) => {
+      if (event.source === window && event.data?.__mcx === "down" && event.data.type === "query-state") publish(true);
+    });
+    window.addEventListener("pagehide", () => {
+      hidden = true;
+      if (timer !== null) clearTimeout(timer);
+      timer = null;
+    });
+    window.addEventListener("pageshow", () => {
+      hidden = false;
+      discover(document);
+      publish(true);
+    });
+    publish(true);
+  }
+
   // src/page-hook.ts
   (() => {
+    try {
+      installBufferingObserver();
+    } catch (_) {
+    }
     if (window.__mcx_hook_installed) {
       try {
         window.postMessage({ __mcx: "down", type: "query-state" }, "*");
@@ -33,10 +180,11 @@
     let sessionPositionState = null;
     let hasEverPlayedMediaSession = false;
     const trackedElements = /* @__PURE__ */ new Set();
+    const observedElements = /* @__PURE__ */ new WeakSet();
+    const handledMediaEvents = /* @__PURE__ */ new WeakSet();
     const trackedAudioContexts = /* @__PURE__ */ new Set();
     const suspendedByUs = /* @__PURE__ */ new WeakSet();
     const elementsPlayedWithAudio = /* @__PURE__ */ new WeakSet();
-    const waitingForData = /* @__PURE__ */ new WeakSet();
     const pausedByUs = /* @__PURE__ */ new Set();
     let lastPausedElement = null;
     let lastPausedTime = 0;
@@ -45,7 +193,6 @@
     let activeAudioContext = null;
     let currentFrameState = null;
     let evalTimer = null;
-    let bufferingPollTimer = null;
     let lastKnownHref = typeof window !== "undefined" && window.location ? window.location.href : "";
     let pendingColdPlayUntil = 0;
     let ytPlayGeneration = 0;
@@ -351,6 +498,12 @@
     function registerElement(el) {
       if (!el || !(el instanceof HTMLMediaElement)) return;
       if (isInlinePreviewElement(el)) return;
+      if (!observedElements.has(el)) {
+        observedElements.add(el);
+        for (const ev of MEDIA_EVENTS) {
+          el.addEventListener(ev, handleMediaEvent, true);
+        }
+      }
       for (const ref of trackedElements) {
         if (ref.deref() === el) return;
       }
@@ -398,17 +551,6 @@
     }
     function postState(state) {
       currentFrameState = state;
-      if (state?.buffering) {
-        if (bufferingPollTimer === null) {
-          bufferingPollTimer = window.setTimeout(() => {
-            bufferingPollTimer = null;
-            scheduleEvaluation();
-          }, 300);
-        }
-      } else if (bufferingPollTimer !== null) {
-        clearTimeout(bufferingPollTimer);
-        bufferingPollTimer = null;
-      }
       const msg = {
         __mcx: "up",
         state
@@ -442,17 +584,6 @@
         (el) => !el.muted && el.volume > 0
       );
       const ytVideoId = isYouTube ? getYouTubeVideoId() : null;
-      const ytMedia = audiblePlaying[0] || playingElements[0] || activePrimaryElement || elements[0];
-      let ytPlayerBuffering = false;
-      if (isYouTube) {
-        try {
-          ytPlayerBuffering = getYtPlayer()?.getPlayerState?.() === 3;
-        } catch (_) {
-        }
-      }
-      const buffering = Boolean(
-        isYouTube && ytVideoId && !autoplayBlocked && (hasConfirmedPlayback || hadTrustedGesture) && (ytPlayerBuffering || ytMedia && !ytMedia.ended && (ytMedia.seeking || waitingForData.has(ytMedia)))
-      );
       if (isYouTube && !ytVideoId && audiblePlaying.length === 0) {
         resetSessionState();
         postState(null);
@@ -638,8 +769,7 @@
           seekable: isSeekable,
           volume: getPrimaryVolumeState(),
           lastPlayedAt: lastPlayedAtEpoch,
-          playBlocked: autoplayBlocked,
-          buffering
+          playBlocked: autoplayBlocked
         });
         return;
       }
@@ -679,8 +809,7 @@
           seekable,
           volume: getPrimaryVolumeState(),
           lastPlayedAt: lastPlayedAtEpoch,
-          playBlocked: false,
-          buffering
+          playBlocked: false
         });
         return;
       }
@@ -715,8 +844,7 @@
           seekable,
           volume: getPrimaryVolumeState(),
           lastPlayedAt: lastPlayedAtEpoch,
-          playBlocked: autoplayBlocked,
-          buffering
+          playBlocked: autoplayBlocked
         });
         return;
       }
@@ -758,7 +886,6 @@
           ...previous,
           playbackState: "paused",
           playBlocked: autoplayBlocked,
-          buffering: false,
           position: previous.position ? {
             ...previous.position,
             playbackRate: 0,
@@ -1733,17 +1860,14 @@
       };
     } catch (_) {
     }
-    const handleMediaEvent = (e) => {
+    function handleMediaEvent(e) {
+      if (handledMediaEvents.has(e)) return;
+      handledMediaEvents.add(e);
       const target = e.target;
       if (target && target instanceof HTMLMediaElement) {
         if (isInlinePreviewElement(target)) return;
         registerElement(target);
         const hasAudio = !target.muted && target.volume > 0;
-        if (e.type === "waiting" && !target.paused) {
-          waitingForData.add(target);
-        } else if (e.type === "playing" || e.type === "canplay" || e.type === "canplaythrough" || e.type === "pause" || e.type === "ended" || e.type === "emptied" || e.type === "seeked" && target.readyState >= 3) {
-          waitingForData.delete(target);
-        }
         if (e.type === "playing") {
           pendingColdPlayUntil = 0;
           if (hasAudio || hadTrustedGesture) {
@@ -1778,7 +1902,7 @@
         }
         scheduleEvaluation();
       }
-    };
+    }
     for (const ev of MEDIA_EVENTS) {
       document.addEventListener(ev, handleMediaEvent, true);
       window.addEventListener(ev, handleMediaEvent, true);

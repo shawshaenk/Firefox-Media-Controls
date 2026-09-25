@@ -423,10 +423,6 @@ scrollbar {
   to { transform: rotate(360deg); }
 }
 
-@media (prefers-reduced-motion: reduce) {
-  .play-btn.is-buffering::after { animation: none; }
-}
-
 @media (prefers-color-scheme: dark) {
   .play-btn:hover {
     filter: brightness(1.1);

@@ -1,5 +1,5 @@
 import { sanitizeFrameState, sanitizeCommand } from "./shared/validation";
-import type { McxDownMessage, McxUpMessage, RelayToBgMessage } from "./shared/protocol";
+import type { FrameState, McxDownMessage, McxUpMessage, RelayToBgMessage } from "./shared/protocol";
 
 (() => {
   // The manifest and background injection can both load this script in the
@@ -12,6 +12,25 @@ import type { McxDownMessage, McxUpMessage, RelayToBgMessage } from "./shared/pr
   let pendingState: unknown;
   let stateTimer: number | null = null;
   let lastSentAt = -Infinity;
+  let lastSentBuffering = false;
+  let observedBuffering: boolean | undefined;
+  let latestFrame: FrameState | null = null;
+
+  function queueState(state: FrameState | null) {
+    const updated = state && observedBuffering !== undefined
+      ? { ...state, buffering: observedBuffering && !state.playBlocked }
+      : state;
+    pendingState = updated;
+    if (updated?.buffering === true && !lastSentBuffering) {
+      if (stateTimer !== null) clearTimeout(stateTimer);
+      flushState();
+      return;
+    }
+    if (stateTimer !== null) return;
+    const wait = Math.max(0, 100 - (performance.now() - lastSentAt));
+    if (wait === 0) flushState();
+    else stateTimer = window.setTimeout(flushState, wait);
+  }
 
   function flushState() {
     stateTimer = null;
@@ -21,6 +40,7 @@ import type { McxDownMessage, McxUpMessage, RelayToBgMessage } from "./shared/pr
     // Invalid data must not erase a legitimate session.
     if (raw !== null && state === null) return;
     lastSentAt = performance.now();
+    lastSentBuffering = state?.buffering === true;
     browser.runtime.sendMessage({ type: "frame-state", state } as RelayToBgMessage).catch(() => {});
   }
 
@@ -37,20 +57,23 @@ import type { McxDownMessage, McxUpMessage, RelayToBgMessage } from "./shared/pr
       }
       return;
     }
+    if (data.__mcx === "buffering-state") {
+      if (typeof data.buffering !== "boolean") return;
+      observedBuffering = data.buffering;
+      if (latestFrame) queueState(latestFrame);
+      return;
+    }
     if (data.__mcx !== "up") return;
-
-    // Keep only the latest update. Command acknowledgements above bypass this
-    // limiter so a noisy page cannot delay a user's play/pause command.
-    pendingState = data.state;
-    if (stateTimer !== null) return;
-    const wait = Math.max(0, 100 - (performance.now() - lastSentAt));
-    if (wait === 0) flushState();
-    else stateTimer = window.setTimeout(flushState, wait);
+    const clean = sanitizeFrameState(data.state);
+    if (data.state !== null && clean === null) return;
+    latestFrame = clean;
+    queueState(clean);
   });
 
   window.addEventListener("pagehide", (event) => {
     if (!event.isTrusted) return;
     if (stateTimer !== null) clearTimeout(stateTimer);
+    latestFrame = null;
     pendingState = null;
     flushState();
   });

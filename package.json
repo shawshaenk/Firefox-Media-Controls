@@ -1,6 +1,6 @@
 {
   "name": "firefox-media-controller",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "Chrome Media Controls for Firefox",
   "scripts": {
     "package": "python3 scripts/generate-icons.py && npm run build && python3 scripts/package.py",

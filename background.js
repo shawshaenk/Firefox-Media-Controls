@@ -1027,6 +1027,7 @@
           registry.set(tabId, /* @__PURE__ */ new Map());
         }
         const frameMap = registry.get(tabId);
+        const wasBuffering = frameMap.get(frameId)?.buffering === true;
         if (message.state === null) {
           frameMap.delete(frameId);
           if (frameMap.size === 0) {
@@ -1055,7 +1056,17 @@
           });
           noteYouTubeVideo(tabId, sender.tab.url ?? current.url);
         }
-        scheduleFrameUpdates();
+        if (wasBuffering !== (state?.buffering === true)) {
+          if (frameUpdateTimer !== null) {
+            clearTimeout(frameUpdateTimer);
+            frameUpdateTimer = null;
+          }
+          lastFrameUpdate = performance.now();
+          void persistState();
+          broadcastSessions();
+        } else {
+          scheduleFrameUpdates();
+        }
       }
     }
   );
