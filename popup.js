@@ -1,5 +1,20 @@
 "use strict";
 (() => {
+  // src/shared/validation.ts
+  function safeImageUrl(value) {
+    if (typeof value !== "string" || value.length > 32768) return null;
+    const src = value.trim();
+    if (/^data:image\/(?:png|jpeg|gif|webp|avif|svg\+xml|x-icon|vnd\.microsoft\.icon)(?:;|,)/i.test(src)) return src;
+    if (src.length > 8192) return null;
+    try {
+      const url = new URL(src);
+      if (url.protocol !== "https:" && url.protocol !== "http:" || url.username || url.password) return null;
+      return url.href;
+    } catch (_) {
+      return null;
+    }
+  }
+
   // src/popup/icons.ts
   var ICON_PATHS = {
     expand_more: "M480-383q-7 0-13-2.5t-11-7.5L272-577q-11-11-11-28t11-28q11-11 28-11t28 11l152 152 152-152q11-11 28-11t28 11q11 11 11 28t-11 28L504-393q-5 5-11 7.5t-13 2.5Z",
@@ -440,6 +455,7 @@
     const sourceFavicon = document.createElement("img");
     sourceFavicon.className = "source-favicon";
     sourceFavicon.alt = "";
+    sourceFavicon.referrerPolicy = "no-referrer";
     const sourceHostname = document.createElement("span");
     sourceHostname.className = "source-hostname";
     sourceRow.appendChild(sourceFavicon);
@@ -1083,44 +1099,45 @@
     card.volumeBtn.setAttribute("aria-controls", card.volumeSection.id);
     const hostname = session.hostname || "browser";
     card.sourceHostname.textContent = hostname;
-    if (session.favIconUrl) {
-      card.sourceFavicon.src = session.favIconUrl;
+    const favicon = safeImageUrl(session.favIconUrl);
+    if (favicon) {
+      if (card.sourceFavicon.getAttribute("src") !== favicon) card.sourceFavicon.src = favicon;
       card.sourceFavicon.style.display = "block";
     } else {
+      card.sourceFavicon.removeAttribute("src");
       card.sourceFavicon.style.display = "none";
     }
     const meta = session.state?.metadata;
     card.titleEl.textContent = meta?.title || session.tabTitle || "Untitled audio";
     card.artistEl.textContent = meta?.artist || "";
-    const bestArtwork = chooseBestArtwork(meta?.artwork);
-    if (bestArtwork && !session.degraded) {
-      const img = document.createElement("img");
-      img.className = "artwork-img";
-      img.alt = "";
-      img.src = bestArtwork;
-      img.onerror = () => {
-        if (session.favIconUrl) {
-          const fav = document.createElement("img");
-          fav.className = "artwork-fallback";
-          fav.alt = "";
-          fav.src = session.favIconUrl;
-          card.artworkContainer.replaceChildren(fav);
-        } else {
+    const artwork = session.degraded ? null : safeImageUrl(chooseBestArtwork(meta?.artwork));
+    const imageKey = JSON.stringify([artwork, favicon]);
+    if (card.artworkContainer.dataset.imageKey !== imageKey) {
+      card.artworkContainer.dataset.imageKey = imageKey;
+      const showFavicon = () => {
+        if (card.artworkContainer.dataset.imageKey !== imageKey) return;
+        card.artworkImg = null;
+        if (!favicon) {
           card.artworkContainer.replaceChildren();
+          return;
         }
+        const fav = document.createElement("img");
+        fav.className = "artwork-fallback";
+        fav.alt = "";
+        fav.referrerPolicy = "no-referrer";
+        fav.src = favicon;
+        card.artworkContainer.replaceChildren(fav);
       };
-      card.artworkContainer.replaceChildren(img);
-      card.artworkImg = img;
-    } else if (session.favIconUrl) {
-      const fav = document.createElement("img");
-      fav.className = "artwork-fallback";
-      fav.alt = "";
-      fav.src = session.favIconUrl;
-      card.artworkContainer.replaceChildren(fav);
-      card.artworkImg = null;
-    } else {
-      card.artworkContainer.replaceChildren();
-      card.artworkImg = null;
+      if (artwork) {
+        const img = document.createElement("img");
+        img.className = "artwork-img";
+        img.alt = "";
+        img.referrerPolicy = "no-referrer";
+        img.onerror = showFavicon;
+        img.src = artwork;
+        card.artworkContainer.replaceChildren(img);
+        card.artworkImg = img;
+      } else showFavicon();
     }
     updatePlayButton(card);
     updateVolumeUI(card);

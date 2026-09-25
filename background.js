@@ -1,15 +1,160 @@
 "use strict";
 (() => {
+  // src/shared/validation.ts
+  var ALLOWED_ACTIONS = /* @__PURE__ */ new Set([
+    "play",
+    "pause",
+    "previoustrack",
+    "nexttrack",
+    "seekbackward",
+    "seekforward",
+    "seekto",
+    "setvolume",
+    "stop"
+  ]);
+  function sanitizeString(str, maxLen = 300) {
+    if (typeof str !== "string") return "";
+    return str.slice(0, maxLen);
+  }
+  function safeImageUrl(value) {
+    if (typeof value !== "string" || value.length > 32768) return null;
+    const src = value.trim();
+    if (/^data:image\/(?:png|jpeg|gif|webp|avif|svg\+xml|x-icon|vnd\.microsoft\.icon)(?:;|,)/i.test(src)) return src;
+    if (src.length > 8192) return null;
+    try {
+      const url = new URL(src);
+      if (url.protocol !== "https:" && url.protocol !== "http:" || url.username || url.password) return null;
+      return url.href;
+    } catch (_) {
+      return null;
+    }
+  }
+  function sanitizeArtwork(list) {
+    if (!Array.isArray(list)) return [];
+    const valid = [];
+    for (const item of list.slice(0, 8)) {
+      const src = safeImageUrl(item?.src);
+      if (src) valid.push({ src, sizes: sanitizeString(item.sizes, 50), type: sanitizeString(item.type, 50) });
+    }
+    return valid;
+  }
+  function sanitizeMetadata(meta) {
+    if (!meta || typeof meta !== "object") return null;
+    return {
+      title: sanitizeString(meta.title, 300),
+      artist: sanitizeString(meta.artist, 300),
+      album: sanitizeString(meta.album, 300),
+      artwork: sanitizeArtwork(meta.artwork)
+    };
+  }
+  function sanitizePosition(pos) {
+    if (!pos || typeof pos !== "object") return null;
+    const duration = pos.duration === Infinity ? Infinity : typeof pos.duration === "number" && isFinite(pos.duration) ? Math.max(0, pos.duration) : NaN;
+    if (isNaN(duration)) return null;
+    const position = typeof pos.position === "number" && isFinite(pos.position) ? Math.max(0, pos.position) : 0;
+    const playbackRate = typeof pos.playbackRate === "number" && isFinite(pos.playbackRate) && pos.playbackRate > 0 ? pos.playbackRate : 1;
+    const updatedAt = typeof pos.updatedAt === "number" && isFinite(pos.updatedAt) ? pos.updatedAt : Date.now();
+    return {
+      duration,
+      position,
+      playbackRate,
+      updatedAt
+    };
+  }
+  function sanitizeVolume(vol) {
+    if (!vol || typeof vol !== "object") return null;
+    if (typeof vol.level !== "number" || !isFinite(vol.level)) return null;
+    const level = Math.min(1, Math.max(0, vol.level));
+    return {
+      level,
+      mediaMuted: vol.mediaMuted === true
+    };
+  }
+  function sanitizeFrameState(state) {
+    if (!state || typeof state !== "object") return null;
+    const source = state.source === "mediasession" || state.source === "element" || state.source === "webaudio" ? state.source : null;
+    if (!source) return null;
+    const playbackState = state.playbackState === "playing" || state.playbackState === "paused" || state.playbackState === "none" ? state.playbackState : "none";
+    const actions = [];
+    if (Array.isArray(state.actions)) {
+      for (const a of state.actions.slice(0, 32)) {
+        if (ALLOWED_ACTIONS.has(a) && !actions.includes(a)) {
+          actions.push(a);
+        }
+      }
+    }
+    const isLive = Boolean(state.isLive);
+    const seekable = Boolean(state.seekable);
+    const lastPlayedAt = typeof state.lastPlayedAt === "number" && isFinite(state.lastPlayedAt) ? Math.min(Date.now(), Math.max(0, state.lastPlayedAt)) : Date.now();
+    const playBlocked = state.playBlocked === true;
+    return {
+      source,
+      metadata: sanitizeMetadata(state.metadata),
+      playbackState,
+      position: sanitizePosition(state.position),
+      actions,
+      isLive,
+      seekable,
+      volume: sanitizeVolume(state.volume),
+      lastPlayedAt,
+      playBlocked
+    };
+  }
+  function sanitizeCommand(cmd) {
+    if (!cmd || typeof cmd !== "object" || typeof cmd.action !== "string") return null;
+    if (!ALLOWED_ACTIONS.has(cmd.action)) return null;
+    const sanitized = { action: cmd.action };
+    if (typeof cmd.seekTime === "number" && isFinite(cmd.seekTime)) {
+      sanitized.seekTime = Math.max(0, cmd.seekTime);
+    }
+    if (typeof cmd.offset === "number" && isFinite(cmd.offset)) {
+      sanitized.offset = cmd.offset;
+    }
+    if (cmd.action === "setvolume") {
+      if (typeof cmd.volume !== "number" || !isFinite(cmd.volume)) return null;
+      sanitized.volume = Math.min(1, Math.max(0, cmd.volume));
+    } else if (typeof cmd.volume === "number" && isFinite(cmd.volume)) {
+      sanitized.volume = Math.min(1, Math.max(0, cmd.volume));
+    }
+    return sanitized;
+  }
+
+  // src/shared/order-keys.ts
+  var keyPromise;
+  async function installationKey() {
+    const stored = await browser.storage.local.get("orderKeySecret");
+    let secret = stored.orderKeySecret;
+    if (!Array.isArray(secret) || secret.length !== 32 || !secret.every((n) => Number.isInteger(n) && Number(n) >= 0 && Number(n) <= 255)) {
+      secret = Array.from(crypto.getRandomValues(new Uint8Array(32)));
+      await browser.storage.local.set({ orderKeySecret: secret });
+    }
+    return crypto.subtle.importKey(
+      "raw",
+      new Uint8Array(secret),
+      { name: "HMAC", hash: "SHA-256" },
+      false,
+      ["sign"]
+    );
+  }
+  async function orderKey(url) {
+    keyPromise ??= installationKey().catch((error) => {
+      keyPromise = void 0;
+      throw error;
+    });
+    const signature = await crypto.subtle.sign("HMAC", await keyPromise, new TextEncoder().encode(url));
+    return "hmac:" + Array.from(new Uint8Array(signature), (byte) => byte.toString(16).padStart(2, "0")).join("");
+  }
+
   // src/background.ts
   var registry = /* @__PURE__ */ new Map();
   var tabsInfo = /* @__PURE__ */ new Map();
   var connectedPopupPorts = /* @__PURE__ */ new Set();
   var lastOrderedTabIds = [];
   var customTabOrder = [];
-  var customOrderUrls = [];
+  var customOrderKeys = [];
   var pinnedTabIds = /* @__PURE__ */ new Set();
   var pinnedTabOrder = [];
-  var pinnedUrls = [];
+  var pinnedKeys = [];
   var openTabIds = /* @__PURE__ */ new Set();
   var playbackCommandQueues = /* @__PURE__ */ new Map();
   var youtubeVideoHistory = /* @__PURE__ */ new Map();
@@ -360,12 +505,28 @@
       youtubeBackTargets.delete(tabId);
     }
   }
-  function updatePinnedUrl(tabId, previousUrl, nextUrl) {
-    if (!pinnedTabIds.has(tabId) || !previousUrl || !nextUrl || previousUrl === nextUrl) return;
-    const index = pinnedUrls.indexOf(previousUrl);
+  var urlOrderKeys = /* @__PURE__ */ new Map();
+  function knownOrderKey(url) {
+    return url ? urlOrderKeys.get(url) || "" : "";
+  }
+  async function rememberOrderKey(url) {
+    if (!url) return "";
+    const existing = urlOrderKeys.get(url);
+    if (existing) return existing;
+    const key = await orderKey(url);
+    urlOrderKeys.set(url, key);
+    return key;
+  }
+  async function updatePinnedUrl(tabId, previousUrl, nextUrl) {
+    const [previousKey, nextKey] = await Promise.all([
+      rememberOrderKey(previousUrl),
+      rememberOrderKey(nextUrl)
+    ]);
+    if (!pinnedTabIds.has(tabId) || !previousKey || !nextKey || previousKey === nextKey) return;
+    const index = pinnedKeys.indexOf(previousKey);
     if (index >= 0) {
-      pinnedUrls[index] = nextUrl;
-      void browser.storage.local.set({ pinnedUrls }).catch(() => {
+      pinnedKeys[index] = nextKey;
+      void browser.storage.local.set({ pinnedKeys }).catch(() => {
       });
     }
   }
@@ -426,15 +587,21 @@
           "pinnedTabOrder",
           "youtubeVideoHistory"
         ]),
-        browser.storage.local.get(["customOrderUrls", "pinnedUrls", "pinnedOrderMigrated"])
+        browser.storage.local.get(["customOrderKeys", "pinnedKeys", "customOrderUrls", "pinnedUrls", "pinnedOrderMigrated"])
       ]);
+      for (const [current, legacy] of [["customOrderKeys", "customOrderUrls"], ["pinnedKeys", "pinnedUrls"]]) {
+        if (!Array.isArray(savedOrder[current]) && Array.isArray(savedOrder[legacy])) {
+          savedOrder[current] = await Promise.all(savedOrder[legacy].filter((url) => typeof url === "string" && url.length > 0).map((url) => rememberOrderKey(url)));
+        }
+      }
       if (data.registry && typeof data.registry === "object") {
         registry.clear();
         for (const [tabIdStr, frameMapObj] of Object.entries(data.registry)) {
           const tabId = Number(tabIdStr);
           const frameMap = /* @__PURE__ */ new Map();
           for (const [frameIdStr, state] of Object.entries(frameMapObj)) {
-            frameMap.set(Number(frameIdStr), state);
+            const cleanState = sanitizeFrameState(state);
+            if (cleanState) frameMap.set(Number(frameIdStr), cleanState);
           }
           registry.set(tabId, frameMap);
         }
@@ -451,8 +618,8 @@
       if (Array.isArray(data.customTabOrder)) {
         customTabOrder = data.customTabOrder;
       }
-      if (Array.isArray(savedOrder.customOrderUrls)) {
-        customOrderUrls = savedOrder.customOrderUrls.filter(
+      if (Array.isArray(savedOrder.customOrderKeys)) {
+        customOrderKeys = savedOrder.customOrderKeys.filter(
           (url) => typeof url === "string" && url.length > 0
         );
       }
@@ -477,21 +644,23 @@
           }
         }
       }
-      if (Array.isArray(savedOrder.pinnedUrls)) {
-        pinnedUrls = savedOrder.pinnedUrls.filter(
+      if (Array.isArray(savedOrder.pinnedKeys)) {
+        pinnedKeys = savedOrder.pinnedKeys.filter(
           (url) => typeof url === "string" && url.length > 0
         );
-        if (savedOrder.pinnedOrderMigrated !== true && customOrderUrls.length > 0) {
-          const remaining = [...pinnedUrls];
+        if (savedOrder.pinnedOrderMigrated !== true && customOrderKeys.length > 0) {
+          const remaining = [...pinnedKeys];
           const ordered = [];
-          for (const url of customOrderUrls) {
+          for (const url of customOrderKeys) {
             const index = remaining.indexOf(url);
             if (index >= 0) ordered.push(...remaining.splice(index, 1));
           }
-          pinnedUrls = [...ordered, ...remaining];
-          await browser.storage.local.set({ pinnedUrls, pinnedOrderMigrated: true });
+          pinnedKeys = [...ordered, ...remaining];
+          await browser.storage.local.set({ pinnedKeys, pinnedOrderMigrated: true });
         }
       }
+      await browser.storage.local.set({ customOrderKeys, pinnedKeys, pinnedOrderMigrated: true });
+      await browser.storage.local.remove(["customOrderUrls", "pinnedUrls"]);
     } catch (err) {
       console.warn("[MediaControls Background] Failed to restore state:", err);
     }
@@ -595,32 +764,32 @@
       }
     }
     const rawList = Array.from(sessionsMap.values());
-    const availablePinnedUrls = [...pinnedUrls];
+    const availablePinnedKeys = [...pinnedKeys];
     for (const session of rawList) {
       if (pinnedTabIds.has(session.tabId)) {
         session.pinned = true;
-        const urlIndex = availablePinnedUrls.indexOf(tabsInfo.get(session.tabId)?.url || "");
-        if (urlIndex >= 0) availablePinnedUrls.splice(urlIndex, 1);
+        const urlIndex = availablePinnedKeys.indexOf(knownOrderKey(tabsInfo.get(session.tabId)?.url));
+        if (urlIndex >= 0) availablePinnedKeys.splice(urlIndex, 1);
       }
     }
     for (const session of rawList) {
       if (session.pinned) continue;
-      const urlIndex = availablePinnedUrls.indexOf(tabsInfo.get(session.tabId)?.url || "");
+      const urlIndex = availablePinnedKeys.indexOf(knownOrderKey(tabsInfo.get(session.tabId)?.url));
       if (urlIndex >= 0) {
         session.pinned = true;
         pinnedTabIds.add(session.tabId);
-        availablePinnedUrls.splice(urlIndex, 1);
+        availablePinnedKeys.splice(urlIndex, 1);
       }
     }
     const pinnedFirst = (ordered) => {
       const pinned = ordered.filter((session) => session.pinned);
       const remaining = new Map(pinned.map((session) => [session.tabId, session]));
       const orderedPinned = [];
-      for (const url of pinnedUrls) {
+      for (const url of pinnedKeys) {
         const candidates = Array.from(remaining.values()).filter(
-          (candidate) => tabsInfo.get(candidate.tabId)?.url === url
+          (candidate) => knownOrderKey(tabsInfo.get(candidate.tabId)?.url) === url
         );
-        const session = pinnedTabOrder.map((tabId) => remaining.get(tabId)).find((candidate) => candidate && tabsInfo.get(candidate.tabId)?.url === url) || candidates[0];
+        const session = pinnedTabOrder.map((tabId) => remaining.get(tabId)).find((candidate) => candidate && knownOrderKey(tabsInfo.get(candidate.tabId)?.url) === url) || candidates[0];
         if (session) {
           orderedPinned.push(session);
           remaining.delete(session.tabId);
@@ -663,7 +832,7 @@
       const combined = [...newSessions, ...existingSessions];
       return pinnedFirst(combined);
     }
-    if (customTabOrder.length > 0 || customOrderUrls.length > 0) {
+    if (customTabOrder.length > 0 || customOrderKeys.length > 0) {
       const existingSessions = [];
       const newSessions = [];
       const byId = new Map(rawList.map((s) => [s.tabId, s]));
@@ -674,9 +843,9 @@
           byId.delete(tabId);
         }
       }
-      for (const url of customOrderUrls) {
+      for (const url of customOrderKeys) {
         const s = Array.from(byId.values()).find(
-          (candidate) => tabsInfo.get(candidate.tabId)?.url === url
+          (candidate) => knownOrderKey(tabsInfo.get(candidate.tabId)?.url) === url
         );
         if (s) {
           existingSessions.push(s);
@@ -799,7 +968,7 @@
           url: ""
         };
         recordYouTubeNavigation(tab.id, current.url, tab.url);
-        updatePinnedUrl(tab.id, current.url, tab.url);
+        await updatePinnedUrl(tab.id, current.url, tab.url);
         tabsInfo.set(tab.id, {
           audible: Boolean(tab.audible),
           muted: Boolean(tab.mutedInfo?.muted),
@@ -827,13 +996,29 @@
     const sessions = resolveSessions();
     updateToolbarAction(sessions);
   })();
+  var frameUpdateTimer = null;
+  var lastFrameUpdate = -Infinity;
+  function scheduleFrameUpdates() {
+    if (frameUpdateTimer !== null) return;
+    const flush = () => {
+      frameUpdateTimer = null;
+      lastFrameUpdate = performance.now();
+      void persistState();
+      broadcastSessions();
+    };
+    const wait = Math.max(0, 100 - (performance.now() - lastFrameUpdate));
+    if (wait === 0) flush();
+    else frameUpdateTimer = setTimeout(flush, wait);
+  }
   browser.runtime.onMessage.addListener(
     async (message, sender) => {
       await readyPromise;
       if (message && message.type === "frame-state") {
         const tabId = sender.tab?.id;
         const frameId = sender.frameId ?? 0;
-        if (!tabId) return;
+        if (!tabId || sender.id !== browser.runtime.id) return;
+        const state = sanitizeFrameState(message.state);
+        if (message.state !== null && state === null) return;
         if (!registry.has(tabId)) {
           registry.set(tabId, /* @__PURE__ */ new Map());
         }
@@ -844,7 +1029,7 @@
             registry.delete(tabId);
           }
         } else {
-          frameMap.set(frameId, message.state);
+          frameMap.set(frameId, state);
         }
         if (sender.tab) {
           const current = tabsInfo.get(tabId) || {
@@ -855,7 +1040,7 @@
             url: ""
           };
           recordYouTubeNavigation(tabId, current.url, sender.tab.url);
-          updatePinnedUrl(tabId, current.url, sender.tab.url);
+          await updatePinnedUrl(tabId, current.url, sender.tab.url);
           tabsInfo.set(tabId, {
             ...current,
             audible: sender.tab.audible ?? current.audible,
@@ -866,8 +1051,7 @@
           });
           noteYouTubeVideo(tabId, sender.tab.url ?? current.url);
         }
-        persistState();
-        broadcastSessions();
+        scheduleFrameUpdates();
       }
     }
   );
@@ -885,7 +1069,7 @@
     const newUrl = changeInfo.url || tab.url;
     const prevUrl = tabsInfo.get(tabId)?.url;
     recordYouTubeNavigation(tabId, prevUrl, newUrl);
-    updatePinnedUrl(tabId, prevUrl, newUrl);
+    await updatePinnedUrl(tabId, prevUrl, newUrl);
     if (prevUrl && newUrl && prevUrl !== newUrl) {
       try {
         const oldU = new URL(prevUrl);
@@ -940,7 +1124,7 @@
     broadcastSessions();
   });
   browser.runtime.onConnect.addListener((port) => {
-    if (port.name === "popup") {
+    if (port.name === "popup" && port.sender?.id === browser.runtime.id && port.sender.url?.split(/[?#]/, 1)[0] === browser.runtime.getURL("popup.html")) {
       connectedPopupPorts.add(port);
       void readyPromise.then(() => {
         port.postMessage({ type: "sessions", sessions: resolveSessions() });
@@ -951,8 +1135,16 @@
       });
       port.onMessage.addListener(async (rawMsg) => {
         await readyPromise;
+        if (!rawMsg || typeof rawMsg !== "object") return;
         const msg = rawMsg;
+        if ("tabId" in msg && (!Number.isInteger(msg.tabId) || msg.tabId < 0)) return;
+        if (msg.type === "reorder" && (!Array.isArray(msg.tabIds) || msg.tabIds.length > openTabIds.size || new Set(msg.tabIds).size !== msg.tabIds.length || !msg.tabIds.every((id) => Number.isInteger(id) && openTabIds.has(id)))) return;
+        if (msg.type === "mute" && typeof msg.muted !== "boolean") return;
+        if (msg.type === "pin" && typeof msg.pinned !== "boolean") return;
         if (msg.type === "cmd") {
+          const cmd = sanitizeCommand(msg.cmd);
+          if (!cmd || msg.frameId !== void 0 && (!Number.isInteger(msg.frameId) || msg.frameId < 0)) return;
+          msg.cmd = cmd;
           if (msg.cmd.action === "nexttrack") {
             try {
               const tab = await browser.tabs.get(msg.tabId);
@@ -1047,37 +1239,37 @@
           lastOrderedTabIds = msg.tabIds;
           customTabOrder = msg.tabIds;
           pinnedTabOrder = msg.tabIds.filter((tabId) => pinnedTabIds.has(tabId));
-          const reorderedPinnedUrls = pinnedTabOrder.map((tabId) => tabsInfo.get(tabId)?.url || "").filter((url) => url.length > 0);
-          const absentPinnedUrls = [...pinnedUrls];
-          for (const url of reorderedPinnedUrls) {
-            const index = absentPinnedUrls.indexOf(url);
-            if (index >= 0) absentPinnedUrls.splice(index, 1);
+          const reorderedPinnedKeys = pinnedTabOrder.map((tabId) => knownOrderKey(tabsInfo.get(tabId)?.url)).filter((url) => url.length > 0);
+          const absentPinnedKeys = [...pinnedKeys];
+          for (const url of reorderedPinnedKeys) {
+            const index = absentPinnedKeys.indexOf(url);
+            if (index >= 0) absentPinnedKeys.splice(index, 1);
           }
-          pinnedUrls = [...reorderedPinnedUrls, ...absentPinnedUrls];
-          customOrderUrls = msg.tabIds.map((tabId) => tabsInfo.get(tabId)?.url || "").filter((url) => url.length > 0);
+          pinnedKeys = [...reorderedPinnedKeys, ...absentPinnedKeys];
+          customOrderKeys = msg.tabIds.map((tabId) => knownOrderKey(tabsInfo.get(tabId)?.url)).filter((url) => url.length > 0);
           try {
-            await browser.storage.local.set({ customOrderUrls, pinnedUrls, pinnedOrderMigrated: true });
+            await browser.storage.local.set({ customOrderKeys, pinnedKeys, pinnedOrderMigrated: true });
           } catch (err) {
             console.warn("[MediaControls Background] Failed to save card order:", err);
           }
           await persistState();
           broadcastSessions();
         } else if (msg.type === "pin") {
-          const url = tabsInfo.get(msg.tabId)?.url || "";
+          const url = knownOrderKey(tabsInfo.get(msg.tabId)?.url);
           if (msg.pinned) {
             if (!pinnedTabIds.has(msg.tabId)) {
               pinnedTabIds.add(msg.tabId);
               pinnedTabOrder.push(msg.tabId);
-              if (url) pinnedUrls.push(url);
+              if (url) pinnedKeys.push(url);
             }
           } else {
             pinnedTabIds.delete(msg.tabId);
             pinnedTabOrder = pinnedTabOrder.filter((id) => id !== msg.tabId);
-            const urlIndex = pinnedUrls.indexOf(url);
-            if (urlIndex >= 0) pinnedUrls.splice(urlIndex, 1);
+            const urlIndex = pinnedKeys.indexOf(url);
+            if (urlIndex >= 0) pinnedKeys.splice(urlIndex, 1);
           }
           try {
-            await browser.storage.local.set({ pinnedUrls, pinnedOrderMigrated: true });
+            await browser.storage.local.set({ pinnedKeys, pinnedOrderMigrated: true });
           } catch (err) {
             console.warn("[MediaControls Background] Failed to save pinned cards:", err);
           }

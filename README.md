@@ -52,3 +52,13 @@ npm run lint        # Run web-ext lint
 ```
 
 The extension uses TypeScript, esbuild, and vanilla HTML/CSS/JavaScript for its popup. Its page hook runs in the page's main world to observe and control media; an isolated relay passes sanitized state and commands to the background event page, which maintains sessions and updates the popup.
+
+## Privacy and security
+
+The extension does not collect or transmit user data to the developer or an analytics service. Media details and tab information stay in the browser for the controls to work. The manifest declares `data_collection_permissions.required: ["none"]` for Firefox's no-data-collection disclosure.
+
+Media reports from pages are untrusted. The extension validates and bounds their fields, coalesces frequent updates, and accepts privileged control requests only from its own popup. A page can still misreport its own media; it cannot choose another tab's identity through the media relay.
+
+Saved pins and ordering use installation-specific HMAC identifiers instead of full URLs. Existing saved URLs are migrated and removed. These identifiers preserve exact matching across restarts, including pages with different query parameters. This reduces plaintext URL retention; it does not encrypt the browser profile. Current tab information and YouTube back-navigation history remain in session storage for playback features.
+
+Cover images and favicons can contact their original hosts. The popup sends no referrer with those image requests and reuses loaded image elements across state updates. It preserves legitimate image CDNs and local HTTP media sources; remote artwork is not anonymous.

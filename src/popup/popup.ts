@@ -1,3 +1,4 @@
+import { safeImageUrl } from "../shared/validation";
 import type {
   Action,
   Command,
@@ -565,6 +566,7 @@ function createCardDom(session: Session): CardDom {
   const sourceFavicon = document.createElement("img");
   sourceFavicon.className = "source-favicon";
   sourceFavicon.alt = "";
+  sourceFavicon.referrerPolicy = "no-referrer";
 
   const sourceHostname = document.createElement("span");
   sourceHostname.className = "source-hostname";
@@ -1327,49 +1329,46 @@ function updateCardDom(card: CardDom, session: Session) {
   const hostname = session.hostname || "browser";
   card.sourceHostname.textContent = hostname;
 
-  if (session.favIconUrl) {
-    card.sourceFavicon.src = session.favIconUrl;
+  const favicon = safeImageUrl(session.favIconUrl);
+  if (favicon) {
+    if (card.sourceFavicon.getAttribute("src") !== favicon) card.sourceFavicon.src = favicon;
     card.sourceFavicon.style.display = "block";
   } else {
+    card.sourceFavicon.removeAttribute("src");
     card.sourceFavicon.style.display = "none";
   }
 
   const meta = session.state?.metadata;
-  card.titleEl.textContent =
-    meta?.title || session.tabTitle || "Untitled audio";
+  card.titleEl.textContent = meta?.title || session.tabTitle || "Untitled audio";
   card.artistEl.textContent = meta?.artist || "";
 
-  // 2. Artwork
-  const bestArtwork = chooseBestArtwork(meta?.artwork);
-  if (bestArtwork && !session.degraded) {
-    const img = document.createElement("img");
-    img.className = "artwork-img";
-    img.alt = "";
-    img.src = bestArtwork;
-    img.onerror = () => {
-      // Fallback to favicon tile on load error
-      if (session.favIconUrl) {
-        const fav = document.createElement("img");
-        fav.className = "artwork-fallback";
-        fav.alt = "";
-        fav.src = session.favIconUrl;
-        card.artworkContainer.replaceChildren(fav);
-      } else {
-        card.artworkContainer.replaceChildren();
-      }
+  // Keep image nodes stable: repeated state updates must not trigger fresh
+  // artwork requests. Remote artwork still needs a request to its host.
+  const artwork = session.degraded ? null : safeImageUrl(chooseBestArtwork(meta?.artwork));
+  const imageKey = JSON.stringify([artwork, favicon]);
+  if (card.artworkContainer.dataset.imageKey !== imageKey) {
+    card.artworkContainer.dataset.imageKey = imageKey;
+    const showFavicon = () => {
+      if (card.artworkContainer.dataset.imageKey !== imageKey) return;
+      card.artworkImg = null;
+      if (!favicon) { card.artworkContainer.replaceChildren(); return; }
+      const fav = document.createElement("img");
+      fav.className = "artwork-fallback";
+      fav.alt = "";
+      fav.referrerPolicy = "no-referrer";
+      fav.src = favicon;
+      card.artworkContainer.replaceChildren(fav);
     };
-    card.artworkContainer.replaceChildren(img);
-    card.artworkImg = img;
-  } else if (session.favIconUrl) {
-    const fav = document.createElement("img");
-    fav.className = "artwork-fallback";
-    fav.alt = "";
-    fav.src = session.favIconUrl;
-    card.artworkContainer.replaceChildren(fav);
-    card.artworkImg = null;
-  } else {
-    card.artworkContainer.replaceChildren();
-    card.artworkImg = null;
+    if (artwork) {
+      const img = document.createElement("img");
+      img.className = "artwork-img";
+      img.alt = "";
+      img.referrerPolicy = "no-referrer";
+      img.onerror = showFavicon;
+      img.src = artwork;
+      card.artworkContainer.replaceChildren(img);
+      card.artworkImg = img;
+    } else showFavicon();
   }
 
   // 3. Play button

@@ -1,3 +1,5 @@
+import { sanitizeFrameState, sanitizeCommand } from "./shared/validation";
+import { orderKey } from "./shared/order-keys";
 import type {
   Command,
   FrameState,
@@ -24,11 +26,11 @@ const tabsInfo = new Map<number, TabInfo>();
 let connectedPopupPorts = new Set<browser.runtime.Port>();
 let lastOrderedTabIds: number[] = [];
 let customTabOrder: number[] = [];
-// URLs let a user-defined order survive a browser restart, when tab IDs change.
-let customOrderUrls: string[] = [];
+// Opaque URL identifiers preserve exact matching across browser restarts.
+let customOrderKeys: string[] = [];
 const pinnedTabIds = new Set<number>();
 let pinnedTabOrder: number[] = [];
-let pinnedUrls: string[] = [];
+let pinnedKeys: string[] = [];
 let openTabIds = new Set<number>();
 const playbackCommandQueues = new Map<number, Promise<void>>();
 const youtubeVideoHistory = new Map<number, string[]>();
@@ -441,12 +443,27 @@ function recordYouTubeNavigation(tabId: number, previousUrl?: string, nextUrl?: 
   }
 }
 
-function updatePinnedUrl(tabId: number, previousUrl?: string, nextUrl?: string) {
-  if (!pinnedTabIds.has(tabId) || !previousUrl || !nextUrl || previousUrl === nextUrl) return;
-  const index = pinnedUrls.indexOf(previousUrl);
+const urlOrderKeys = new Map<string, string>();
+function knownOrderKey(url: string | undefined): string {
+  return url ? urlOrderKeys.get(url) || "" : "";
+}
+async function rememberOrderKey(url: string | undefined): Promise<string> {
+  if (!url) return "";
+  const existing = urlOrderKeys.get(url);
+  if (existing) return existing;
+  const key = await orderKey(url);
+  urlOrderKeys.set(url, key);
+  return key;
+}
+async function updatePinnedUrl(tabId: number, previousUrl?: string, nextUrl?: string) {
+  const [previousKey, nextKey] = await Promise.all([
+    rememberOrderKey(previousUrl), rememberOrderKey(nextUrl)
+  ]);
+  if (!pinnedTabIds.has(tabId) || !previousKey || !nextKey || previousKey === nextKey) return;
+  const index = pinnedKeys.indexOf(previousKey);
   if (index >= 0) {
-    pinnedUrls[index] = nextUrl;
-    void browser.storage.local.set({ pinnedUrls }).catch(() => {});
+    pinnedKeys[index] = nextKey;
+    void browser.storage.local.set({ pinnedKeys }).catch(() => {});
   }
 }
 
@@ -513,8 +530,16 @@ async function restoreState() {
         "pinnedTabOrder",
         "youtubeVideoHistory"
       ]),
-      browser.storage.local.get(["customOrderUrls", "pinnedUrls", "pinnedOrderMigrated"])
+      browser.storage.local.get(["customOrderKeys", "pinnedKeys", "customOrderUrls", "pinnedUrls", "pinnedOrderMigrated"])
     ]);
+
+    for (const [current, legacy] of [["customOrderKeys", "customOrderUrls"], ["pinnedKeys", "pinnedUrls"]]) {
+      if (!Array.isArray(savedOrder[current]) && Array.isArray(savedOrder[legacy])) {
+        savedOrder[current] = await Promise.all(savedOrder[legacy]
+          .filter((url: unknown): url is string => typeof url === "string" && url.length > 0)
+          .map((url: string) => rememberOrderKey(url)));
+      }
+    }
 
     if (data.registry && typeof data.registry === "object") {
       registry.clear();
@@ -522,7 +547,8 @@ async function restoreState() {
         const tabId = Number(tabIdStr);
         const frameMap = new Map<number, FrameState>();
         for (const [frameIdStr, state] of Object.entries(frameMapObj as Record<string, any>)) {
-          frameMap.set(Number(frameIdStr), state as FrameState);
+          const cleanState = sanitizeFrameState(state);
+          if (cleanState) frameMap.set(Number(frameIdStr), cleanState);
         }
         registry.set(tabId, frameMap);
       }
@@ -542,8 +568,8 @@ async function restoreState() {
     if (Array.isArray(data.customTabOrder)) {
       customTabOrder = data.customTabOrder;
     }
-    if (Array.isArray(savedOrder.customOrderUrls)) {
-      customOrderUrls = savedOrder.customOrderUrls.filter(
+    if (Array.isArray(savedOrder.customOrderKeys)) {
+      customOrderKeys = savedOrder.customOrderKeys.filter(
         (url: unknown): url is string => typeof url === "string" && url.length > 0
       );
     }
@@ -569,21 +595,23 @@ async function restoreState() {
         }
       }
     }
-    if (Array.isArray(savedOrder.pinnedUrls)) {
-      pinnedUrls = savedOrder.pinnedUrls.filter(
+    if (Array.isArray(savedOrder.pinnedKeys)) {
+      pinnedKeys = savedOrder.pinnedKeys.filter(
         (url: unknown): url is string => typeof url === "string" && url.length > 0
       );
-      if (savedOrder.pinnedOrderMigrated !== true && customOrderUrls.length > 0) {
-        const remaining = [...pinnedUrls];
+      if (savedOrder.pinnedOrderMigrated !== true && customOrderKeys.length > 0) {
+        const remaining = [...pinnedKeys];
         const ordered: string[] = [];
-        for (const url of customOrderUrls) {
+        for (const url of customOrderKeys) {
           const index = remaining.indexOf(url);
           if (index >= 0) ordered.push(...remaining.splice(index, 1));
         }
-        pinnedUrls = [...ordered, ...remaining];
-        await browser.storage.local.set({ pinnedUrls, pinnedOrderMigrated: true });
+        pinnedKeys = [...ordered, ...remaining];
+        await browser.storage.local.set({ pinnedKeys, pinnedOrderMigrated: true });
       }
     }
+    await browser.storage.local.set({ customOrderKeys, pinnedKeys, pinnedOrderMigrated: true });
+    await browser.storage.local.remove(["customOrderUrls", "pinnedUrls"]);
   } catch (err) {
     console.warn("[MediaControls Background] Failed to restore state:", err);
   }
@@ -727,21 +755,21 @@ function resolveSessions(): Session[] {
   // reports its own frame state and gets its own card so the user can control
   // every tab independently.
   const rawList = Array.from(sessionsMap.values());
-  const availablePinnedUrls = [...pinnedUrls];
+  const availablePinnedKeys = [...pinnedKeys];
   for (const session of rawList) {
     if (pinnedTabIds.has(session.tabId)) {
       session.pinned = true;
-      const urlIndex = availablePinnedUrls.indexOf(tabsInfo.get(session.tabId)?.url || "");
-      if (urlIndex >= 0) availablePinnedUrls.splice(urlIndex, 1);
+      const urlIndex = availablePinnedKeys.indexOf(knownOrderKey(tabsInfo.get(session.tabId)?.url));
+      if (urlIndex >= 0) availablePinnedKeys.splice(urlIndex, 1);
     }
   }
   for (const session of rawList) {
     if (session.pinned) continue;
-    const urlIndex = availablePinnedUrls.indexOf(tabsInfo.get(session.tabId)?.url || "");
+    const urlIndex = availablePinnedKeys.indexOf(knownOrderKey(tabsInfo.get(session.tabId)?.url));
     if (urlIndex >= 0) {
       session.pinned = true;
       pinnedTabIds.add(session.tabId);
-      availablePinnedUrls.splice(urlIndex, 1);
+      availablePinnedKeys.splice(urlIndex, 1);
     }
   }
 
@@ -749,13 +777,13 @@ function resolveSessions(): Session[] {
     const pinned = ordered.filter((session) => session.pinned);
     const remaining = new Map(pinned.map((session) => [session.tabId, session]));
     const orderedPinned: Session[] = [];
-    for (const url of pinnedUrls) {
+    for (const url of pinnedKeys) {
       const candidates = Array.from(remaining.values()).filter(
-        (candidate) => tabsInfo.get(candidate.tabId)?.url === url
+        (candidate) => knownOrderKey(tabsInfo.get(candidate.tabId)?.url) === url
       );
       const session = pinnedTabOrder
         .map((tabId) => remaining.get(tabId))
-        .find((candidate) => candidate && tabsInfo.get(candidate.tabId)?.url === url) ||
+        .find((candidate) => candidate && knownOrderKey(tabsInfo.get(candidate.tabId)?.url) === url) ||
         candidates[0];
       if (session) {
         orderedPinned.push(session);
@@ -807,9 +835,9 @@ function resolveSessions(): Session[] {
     return pinnedFirst(combined);
   }
 
-  // Preserve user custom order. IDs work within a browser session; URLs
+  // Preserve user custom order. IDs work within a browser session; URL hashes
   // recover the order after session storage and tab IDs are reset.
-  if (customTabOrder.length > 0 || customOrderUrls.length > 0) {
+  if (customTabOrder.length > 0 || customOrderKeys.length > 0) {
     const existingSessions: Session[] = [];
     const newSessions: Session[] = [];
 
@@ -821,9 +849,9 @@ function resolveSessions(): Session[] {
         byId.delete(tabId);
       }
     }
-    for (const url of customOrderUrls) {
+    for (const url of customOrderKeys) {
       const s = Array.from(byId.values()).find(
-        (candidate) => tabsInfo.get(candidate.tabId)?.url === url
+        (candidate) => knownOrderKey(tabsInfo.get(candidate.tabId)?.url) === url
       );
       if (s) {
         existingSessions.push(s);
@@ -964,7 +992,7 @@ async function refreshTabsAndInject() {
       };
 
       recordYouTubeNavigation(tab.id, current.url, tab.url);
-      updatePinnedUrl(tab.id, current.url, tab.url);
+      await updatePinnedUrl(tab.id, current.url, tab.url);
 
       tabsInfo.set(tab.id, {
         audible: Boolean(tab.audible),
@@ -1001,6 +1029,21 @@ const readyPromise = (async () => {
   updateToolbarAction(sessions);
 })();
 
+let frameUpdateTimer: ReturnType<typeof setTimeout> | null = null;
+let lastFrameUpdate = -Infinity;
+function scheduleFrameUpdates() {
+  if (frameUpdateTimer !== null) return;
+  const flush = () => {
+    frameUpdateTimer = null;
+    lastFrameUpdate = performance.now();
+    void persistState();
+    broadcastSessions();
+  };
+  const wait = Math.max(0, 100 - (performance.now() - lastFrameUpdate));
+  if (wait === 0) flush();
+  else frameUpdateTimer = setTimeout(flush, wait);
+}
+
 // Listen for messages from content script relay
 browser.runtime.onMessage.addListener(
   async (message: any, sender: browser.runtime.MessageSender) => {
@@ -1008,7 +1051,9 @@ browser.runtime.onMessage.addListener(
     if (message && message.type === "frame-state") {
       const tabId = sender.tab?.id;
       const frameId = sender.frameId ?? 0;
-      if (!tabId) return;
+      if (!tabId || sender.id !== browser.runtime.id) return;
+      const state = sanitizeFrameState(message.state);
+      if (message.state !== null && state === null) return;
 
       if (!registry.has(tabId)) {
         registry.set(tabId, new Map());
@@ -1021,7 +1066,7 @@ browser.runtime.onMessage.addListener(
           registry.delete(tabId);
         }
       } else {
-        frameMap.set(frameId, message.state as FrameState);
+        frameMap.set(frameId, state!);
       }
 
       if (sender.tab) {
@@ -1033,7 +1078,7 @@ browser.runtime.onMessage.addListener(
           url: ""
         };
         recordYouTubeNavigation(tabId, current.url, sender.tab.url);
-        updatePinnedUrl(tabId, current.url, sender.tab.url);
+        await updatePinnedUrl(tabId, current.url, sender.tab.url);
         tabsInfo.set(tabId, {
           ...current,
           audible: sender.tab.audible ?? current.audible,
@@ -1045,8 +1090,7 @@ browser.runtime.onMessage.addListener(
         noteYouTubeVideo(tabId, sender.tab.url ?? current.url);
       }
 
-      persistState();
-      broadcastSessions();
+      scheduleFrameUpdates();
     }
   }
 );
@@ -1071,7 +1115,7 @@ browser.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
   const newUrl = changeInfo.url || tab.url;
   const prevUrl = tabsInfo.get(tabId)?.url;
   recordYouTubeNavigation(tabId, prevUrl, newUrl);
-  updatePinnedUrl(tabId, prevUrl, newUrl);
+  await updatePinnedUrl(tabId, prevUrl, newUrl);
   if (prevUrl && newUrl && prevUrl !== newUrl) {
     try {
       const oldU = new URL(prevUrl);
@@ -1142,7 +1186,8 @@ browser.tabs.onRemoved.addListener(async (tabId) => {
 
 // Port connection for popup
 browser.runtime.onConnect.addListener((port) => {
-  if (port.name === "popup") {
+  if (port.name === "popup" && port.sender?.id === browser.runtime.id &&
+      port.sender.url?.split(/[?#]/, 1)[0] === browser.runtime.getURL("popup.html")) {
     connectedPopupPorts.add(port);
     // Register handlers synchronously so the event page retains the port while
     // storage and tab enumeration finish on a cold start.
@@ -1156,8 +1201,18 @@ browser.runtime.onConnect.addListener((port) => {
 
     port.onMessage.addListener(async (rawMsg: any) => {
       await readyPromise;
+      if (!rawMsg || typeof rawMsg !== "object") return;
       const msg = rawMsg as PopupToBgMessage;
+      if ("tabId" in msg && (!Number.isInteger(msg.tabId) || msg.tabId < 0)) return;
+      if (msg.type === "reorder" && (!Array.isArray(msg.tabIds) ||
+          msg.tabIds.length > openTabIds.size || new Set(msg.tabIds).size !== msg.tabIds.length ||
+          !msg.tabIds.every((id) => Number.isInteger(id) && openTabIds.has(id)))) return;
+      if (msg.type === "mute" && typeof msg.muted !== "boolean") return;
+      if (msg.type === "pin" && typeof msg.pinned !== "boolean") return;
       if (msg.type === "cmd") {
+        const cmd = sanitizeCommand(msg.cmd);
+        if (!cmd || (msg.frameId !== undefined && (!Number.isInteger(msg.frameId) || msg.frameId < 0))) return;
+        msg.cmd = cmd;
         if (msg.cmd.action === "nexttrack") {
           try {
             const tab = await browser.tabs.get(msg.tabId);
@@ -1258,41 +1313,41 @@ browser.runtime.onConnect.addListener((port) => {
         lastOrderedTabIds = msg.tabIds;
         customTabOrder = msg.tabIds;
         pinnedTabOrder = msg.tabIds.filter((tabId) => pinnedTabIds.has(tabId));
-        const reorderedPinnedUrls = pinnedTabOrder
-          .map((tabId) => tabsInfo.get(tabId)?.url || "")
+        const reorderedPinnedKeys = pinnedTabOrder
+          .map((tabId) => knownOrderKey(tabsInfo.get(tabId)?.url))
           .filter((url) => url.length > 0);
-        const absentPinnedUrls = [...pinnedUrls];
-        for (const url of reorderedPinnedUrls) {
-          const index = absentPinnedUrls.indexOf(url);
-          if (index >= 0) absentPinnedUrls.splice(index, 1);
+        const absentPinnedKeys = [...pinnedKeys];
+        for (const url of reorderedPinnedKeys) {
+          const index = absentPinnedKeys.indexOf(url);
+          if (index >= 0) absentPinnedKeys.splice(index, 1);
         }
-        pinnedUrls = [...reorderedPinnedUrls, ...absentPinnedUrls];
-        customOrderUrls = msg.tabIds
-          .map((tabId) => tabsInfo.get(tabId)?.url || "")
+        pinnedKeys = [...reorderedPinnedKeys, ...absentPinnedKeys];
+        customOrderKeys = msg.tabIds
+          .map((tabId) => knownOrderKey(tabsInfo.get(tabId)?.url))
           .filter((url) => url.length > 0);
         try {
-          await browser.storage.local.set({ customOrderUrls, pinnedUrls, pinnedOrderMigrated: true });
+          await browser.storage.local.set({ customOrderKeys, pinnedKeys, pinnedOrderMigrated: true });
         } catch (err) {
           console.warn("[MediaControls Background] Failed to save card order:", err);
         }
         await persistState();
         broadcastSessions();
       } else if (msg.type === "pin") {
-        const url = tabsInfo.get(msg.tabId)?.url || "";
+        const url = knownOrderKey(tabsInfo.get(msg.tabId)?.url);
         if (msg.pinned) {
           if (!pinnedTabIds.has(msg.tabId)) {
             pinnedTabIds.add(msg.tabId);
             pinnedTabOrder.push(msg.tabId);
-            if (url) pinnedUrls.push(url);
+            if (url) pinnedKeys.push(url);
           }
         } else {
           pinnedTabIds.delete(msg.tabId);
           pinnedTabOrder = pinnedTabOrder.filter((id) => id !== msg.tabId);
-          const urlIndex = pinnedUrls.indexOf(url);
-          if (urlIndex >= 0) pinnedUrls.splice(urlIndex, 1);
+          const urlIndex = pinnedKeys.indexOf(url);
+          if (urlIndex >= 0) pinnedKeys.splice(urlIndex, 1);
         }
         try {
-          await browser.storage.local.set({ pinnedUrls, pinnedOrderMigrated: true });
+          await browser.storage.local.set({ pinnedKeys, pinnedOrderMigrated: true });
         } catch (err) {
           console.warn("[MediaControls Background] Failed to save pinned cards:", err);
         }
