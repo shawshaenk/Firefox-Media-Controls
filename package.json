@@ -1,6 +1,6 @@
 {
   "name": "firefox-media-controller",
-  "version": "1.0.12",
+  "version": "1.0.0",
   "description": "Firefox Global Media Controls Extension",
   "scripts": {
     "package": "npm run build && python3 scripts/package.py",
@@ -16,7 +16,7 @@
     "webextension"
   ],
   "author": "",
-  "license": "ISC",
+  "license": "MIT",
   "devDependencies": {
     "@types/firefox-webext-browser": "^0.1.34",
     "esbuild": "^0.28.2",
