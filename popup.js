@@ -41,7 +41,9 @@
     return svg;
   }
   function setIcon(container, name) {
+    if (container.dataset.icon === name) return;
     container.replaceChildren(createIcon(name));
+    container.dataset.icon = name;
   }
 
   // src/popup/popup.ts
@@ -52,6 +54,7 @@
   var isDevOverlayActive = false;
   var isReorderingCards = false;
   var pendingSessionsUpdate = null;
+  var preferredCardOrder = null;
   var cardsContainer = document.getElementById("cards-container");
   async function showAudibleFallback() {
     if (!hasHostPermissions || currentSessions.length > 0) return;
@@ -206,6 +209,7 @@
       ...reordered.filter((session) => session.pinned),
       ...reordered.filter((session) => !session.pinned)
     ];
+    preferredCardOrder = currentSessions.map((session) => session.tabId);
     if (port) {
       port.postMessage({
         type: "reorder",
@@ -219,6 +223,7 @@
     if (idx === -1) return;
     const targetIdx = idx + step;
     if (targetIdx < 0 || targetIdx >= allCards.length) return;
+    if (renderedCards.get(Number(allCards[targetIdx].dataset.tabId))?.session.pinned !== renderedCards.get(Number(cardEl.dataset.tabId))?.session.pinned) return;
     const refNode = allCards[targetIdx > idx ? targetIdx + 1 : targetIdx];
     cardsContainer.insertBefore(cardEl, refNode || null);
     commitCardOrder();
@@ -227,14 +232,16 @@
   var activeDragSession = null;
   function dragTargetIndex(session, deltaY) {
     const center = session.cardCenters[session.initialIndex] + deltaY;
+    const top = center - session.cardHeight / 2;
+    const bottom = center + session.cardHeight / 2;
     let target = session.initialIndex;
     if (deltaY > 0) {
-      for (let i = session.initialIndex + 1; i < session.cards.length; i++) {
-        if (center >= session.cardCenters[i]) target = i;
+      for (let i = session.initialIndex + 1; i <= session.maxIndex; i++) {
+        if (bottom >= session.cardCenters[i]) target = i;
       }
     } else {
-      for (let i = session.initialIndex - 1; i >= 0; i--) {
-        if (center <= session.cardCenters[i]) target = i;
+      for (let i = session.initialIndex - 1; i >= session.minIndex; i--) {
+        if (top <= session.cardCenters[i]) target = i;
       }
     }
     return target;
@@ -248,6 +255,11 @@
       const initialIndex = allCards.indexOf(cardEl);
       if (initialIndex === -1) return;
       const rect = cardEl.getBoundingClientRect();
+      const pinned = renderedCards.get(tabId)?.session.pinned;
+      const sameGroupIndices = allCards.flatMap(
+        (card, index) => renderedCards.get(Number(card.dataset.tabId))?.session.pinned === pinned ? [index] : []
+      );
+      if (sameGroupIndices.length < 2) return;
       activeDragSession = {
         dragHandle,
         cardEl,
@@ -260,9 +272,12 @@
           const bounds = card.getBoundingClientRect();
           return bounds.top + bounds.height / 2;
         }),
+        minIndex: sameGroupIndices[0] ?? initialIndex,
+        maxIndex: sameGroupIndices[sameGroupIndices.length - 1] ?? initialIndex,
         hasMovedPastThreshold: false,
         pointerId: e.pointerId
       };
+      isReorderingCards = true;
       dragHandle.setPointerCapture(e.pointerId);
     });
     dragHandle.addEventListener("pointermove", (e) => {
@@ -271,7 +286,6 @@
       if (!activeDragSession.hasMovedPastThreshold) {
         if (Math.abs(deltaY) > 3) {
           activeDragSession.hasMovedPastThreshold = true;
-          isReorderingCards = true;
           cardEl.classList.add("is-dragging");
           dragHandle.classList.add("is-dragging");
           cardsContainer.classList.add("is-reordering");
@@ -318,25 +332,26 @@
       cardsContainer.classList.remove("is-reordering");
       cardEl.classList.remove("is-dragging");
       dragHandle.classList.remove("is-dragging");
-      if (!session.hasMovedPastThreshold) {
-        return;
-      }
       const deltaY = e.clientY - session.startY;
-      const targetIndex = dragTargetIndex(session, deltaY);
+      const didDrop = session.hasMovedPastThreshold && e.type === "pointerup";
+      const targetIndex = didDrop ? dragTargetIndex(session, deltaY) : session.initialIndex;
       for (const c of session.cards) {
         c.style.transform = "";
       }
-      if (targetIndex !== session.initialIndex) {
+      if (didDrop && targetIndex !== session.initialIndex) {
         const currentChildren = Array.from(cardsContainer.children);
         const refNode = currentChildren[targetIndex > session.initialIndex ? targetIndex + 1 : targetIndex];
         cardsContainer.insertBefore(session.cardEl, refNode || null);
+      }
+      const pending = pendingSessionsUpdate;
+      pendingSessionsUpdate = null;
+      if (pending) currentSessions = pending;
+      if (didDrop && targetIndex !== session.initialIndex && currentSessions.some((item) => item.tabId === session.tabId)) {
         commitCardOrder();
       }
       isReorderingCards = false;
-      if (pendingSessionsUpdate) {
-        const pending = pendingSessionsUpdate;
-        pendingSessionsUpdate = null;
-        updateSessionsView(pending);
+      if (pending || didDrop && targetIndex !== session.initialIndex) {
+        updateSessionsView(currentSessions);
       }
     };
     dragHandle.addEventListener("pointerup", endDrag);
@@ -350,7 +365,7 @@
     cardEl.dataset.tabId = String(session.tabId);
     cardEl.addEventListener("click", (e) => {
       const target = e.target;
-      if (target.closest("button") || target.closest("input") || target.closest(".slider-container") || target.closest(".chapter-section") || target.closest(".volume-section") || target.closest(".card-drag-handle")) {
+      if (target.closest("button") || target.closest("input") || target.closest(".slider-container") || target.closest(".chapter-section") || target.closest(".volume-section") || target.closest(".card-toolbar") || target.closest(".card-drag-handle")) {
         return;
       }
       sendFocus(cardDom.session.tabId);
@@ -438,10 +453,12 @@
       const updated = currentSessions.map(
         (item) => item.tabId === cardDom.session.tabId ? { ...item, pinned } : item
       );
-      updateSessionsView([
+      const updatedOrder = [
         ...updated.filter((item) => item.pinned),
         ...updated.filter((item) => !item.pinned)
-      ]);
+      ];
+      preferredCardOrder = updatedOrder.map((item) => item.tabId);
+      updateSessionsView(updatedOrder);
       port?.postMessage({ type: "pin", tabId: cardDom.session.tabId, pinned });
     });
     const topRowEl = document.createElement("div");
@@ -483,18 +500,18 @@
         sendCommand(current.tabId, current.frameId, {
           action: isPlaying ? "pause" : "play"
         });
+        const isSpotify = current.hostname === "open.spotify.com";
         const pending = {
           state: requestedState,
-          expiresAt: Date.now() + 2500
+          // Spotify can report the old state after its control has already
+          // reacted. Keep the clicked icon until its new state stays settled.
+          expiresAt: Date.now() + (isSpotify ? 2500 : 900),
+          confirmedAt: null,
+          settleMs: isSpotify ? 500 : 0
         };
         cardDom.pendingPlayback = pending;
         updatePlayButton(cardDom);
-        window.setTimeout(() => {
-          if (cardDom.pendingPlayback === pending) {
-            cardDom.pendingPlayback = null;
-            updatePlayButton(cardDom);
-          }
-        }, 2500);
+        window.setTimeout(() => reconcilePendingPlayback(cardDom, pending), 100);
       }
     });
     topRowEl.appendChild(artworkContainer);
@@ -774,10 +791,10 @@
     volumeSlider.addEventListener("keyup", (e) => {
       e.stopPropagation();
     });
-    cardEl.appendChild(volumeBtn);
-    cardEl.appendChild(chapterBtn);
-    cardEl.appendChild(pinBtn);
-    cardEl.appendChild(dragHandle);
+    const cardToolbar = document.createElement("div");
+    cardToolbar.className = "card-toolbar";
+    cardToolbar.append(chapterBtn, volumeBtn, pinBtn, dragHandle);
+    cardEl.appendChild(cardToolbar);
     cardEl.appendChild(topRowEl);
     cardEl.appendChild(bottomRowEl);
     cardEl.appendChild(volumeSection);
@@ -1035,6 +1052,26 @@
       card.playBtn.removeAttribute("title");
     }
   }
+  function reconcilePendingPlayback(card, pending) {
+    if (card.pendingPlayback !== pending) return;
+    const now = Date.now();
+    if (card.session.state?.playbackState === pending.state) {
+      pending.confirmedAt ??= now;
+      if (now - pending.confirmedAt >= pending.settleMs) {
+        card.pendingPlayback = null;
+        updatePlayButton(card);
+        return;
+      }
+    } else {
+      pending.confirmedAt = null;
+      if (now >= pending.expiresAt) {
+        card.pendingPlayback = null;
+        updatePlayButton(card);
+        return;
+      }
+    }
+    window.setTimeout(() => reconcilePendingPlayback(card, pending), 100);
+  }
   function applySliderPosition(card, pos, duration) {
     card.lastInterpolatedPos = pos;
     updateActiveChapter(card);
@@ -1189,13 +1226,25 @@
       renderPermissionsMissing();
       return;
     }
+    if (isReorderingCards) {
+      pendingSessionsUpdate = sessions;
+      return;
+    }
+    if (preferredCardOrder) {
+      const rank = new Map(preferredCardOrder.map((tabId, index) => [tabId, index]));
+      const newSessions = sessions.filter((session) => !rank.has(session.tabId));
+      const existingSessions = sessions.filter((session) => rank.has(session.tabId));
+      existingSessions.sort((a, b) => rank.get(a.tabId) - rank.get(b.tabId));
+      const ordered = [...newSessions, ...existingSessions];
+      sessions = [
+        ...ordered.filter((session) => session.pinned),
+        ...ordered.filter((session) => !session.pinned)
+      ];
+      preferredCardOrder = sessions.map((session) => session.tabId);
+    }
     if (sessions.length === 0) {
       currentSessions = [];
       renderEmptyState();
-      return;
-    }
-    if (isReorderingCards) {
-      pendingSessionsUpdate = sessions;
       return;
     }
     currentSessions = sessions;
@@ -1392,8 +1441,7 @@
         connection.onMessage.addListener((rawMsg) => {
           const msg = rawMsg;
           if (msg.type === "sessions") {
-            currentSessions = msg.sessions;
-            updateSessionsView(currentSessions);
+            updateSessionsView(msg.sessions);
             if (currentSessions.length === 0) void showAudibleFallback();
           } else if (msg.type === "chapters") {
             const card = renderedCards.get(msg.tabId);

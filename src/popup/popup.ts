@@ -64,6 +64,8 @@ interface CardDom {
   pendingPlayback: {
     state: "playing" | "paused";
     expiresAt: number;
+    confirmedAt: number | null;
+    settleMs: number;
   } | null;
   pendingSeek: {
     position: number;
@@ -83,6 +85,7 @@ let isDevOverlayActive = false;
 let isReorderingCards = false;
 let suppressCardClick = false;
 let pendingSessionsUpdate: Session[] | null = null;
+let preferredCardOrder: number[] | null = null;
 
 const cardsContainer = document.getElementById("cards-container") as HTMLElement;
 
@@ -250,6 +253,7 @@ function commitCardOrder() {
     ...reordered.filter((session) => session.pinned),
     ...reordered.filter((session) => !session.pinned)
   ];
+  preferredCardOrder = currentSessions.map((session) => session.tabId);
 
   if (port) {
     port.postMessage({
@@ -265,6 +269,8 @@ function moveCardByStep(cardEl: HTMLElement, step: number) {
   if (idx === -1) return;
   const targetIdx = idx + step;
   if (targetIdx < 0 || targetIdx >= allCards.length) return;
+  if (renderedCards.get(Number(allCards[targetIdx].dataset.tabId))?.session.pinned !==
+      renderedCards.get(Number(cardEl.dataset.tabId))?.session.pinned) return;
 
   const refNode = allCards[targetIdx > idx ? targetIdx + 1 : targetIdx];
   cardsContainer.insertBefore(cardEl, refNode || null);
@@ -282,20 +288,24 @@ let activeDragSession: {
   cardHeight: number;
   cards: HTMLElement[];
   cardCenters: number[];
+  minIndex: number;
+  maxIndex: number;
   hasMovedPastThreshold: boolean;
   pointerId: number;
 } | null = null;
 
 function dragTargetIndex(session: NonNullable<typeof activeDragSession>, deltaY: number): number {
   const center = session.cardCenters[session.initialIndex] + deltaY;
+  const top = center - session.cardHeight / 2;
+  const bottom = center + session.cardHeight / 2;
   let target = session.initialIndex;
   if (deltaY > 0) {
-    for (let i = session.initialIndex + 1; i < session.cards.length; i++) {
-      if (center >= session.cardCenters[i]) target = i;
+    for (let i = session.initialIndex + 1; i <= session.maxIndex; i++) {
+      if (bottom >= session.cardCenters[i]) target = i;
     }
   } else {
-    for (let i = session.initialIndex - 1; i >= 0; i--) {
-      if (center <= session.cardCenters[i]) target = i;
+    for (let i = session.initialIndex - 1; i >= session.minIndex; i--) {
+      if (top <= session.cardCenters[i]) target = i;
     }
   }
   return target;
@@ -313,6 +323,11 @@ function setupCardDrag(dragHandle: HTMLElement, cardEl: HTMLElement, tabId: numb
     if (initialIndex === -1) return;
 
     const rect = cardEl.getBoundingClientRect();
+    const pinned = renderedCards.get(tabId)?.session.pinned;
+    const sameGroupIndices = allCards.flatMap((card, index) =>
+      renderedCards.get(Number(card.dataset.tabId))?.session.pinned === pinned ? [index] : []
+    );
+    if (sameGroupIndices.length < 2) return;
 
     activeDragSession = {
       dragHandle,
@@ -326,10 +341,15 @@ function setupCardDrag(dragHandle: HTMLElement, cardEl: HTMLElement, tabId: numb
         const bounds = card.getBoundingClientRect();
         return bounds.top + bounds.height / 2;
       }),
+      minIndex: sameGroupIndices[0] ?? initialIndex,
+      maxIndex: sameGroupIndices[sameGroupIndices.length - 1] ?? initialIndex,
       hasMovedPastThreshold: false,
       pointerId: e.pointerId
     };
 
+    // Freeze incoming session ordering from pointerdown through release. A
+    // background push during the first few pixels must not move the handle.
+    isReorderingCards = true;
     dragHandle.setPointerCapture(e.pointerId);
   });
 
@@ -340,7 +360,6 @@ function setupCardDrag(dragHandle: HTMLElement, cardEl: HTMLElement, tabId: numb
     if (!activeDragSession.hasMovedPastThreshold) {
       if (Math.abs(deltaY) > 3) {
         activeDragSession.hasMovedPastThreshold = true;
-        isReorderingCards = true;
         cardEl.classList.add("is-dragging");
         dragHandle.classList.add("is-dragging");
         cardsContainer.classList.add("is-reordering");
@@ -394,31 +413,30 @@ function setupCardDrag(dragHandle: HTMLElement, cardEl: HTMLElement, tabId: numb
     cardEl.classList.remove("is-dragging");
     dragHandle.classList.remove("is-dragging");
 
-    if (!session.hasMovedPastThreshold) {
-      return;
-    }
-
     const deltaY = e.clientY - session.startY;
-    const targetIndex = dragTargetIndex(session, deltaY);
+    const didDrop = session.hasMovedPastThreshold && e.type === "pointerup";
+    const targetIndex = didDrop ? dragTargetIndex(session, deltaY) : session.initialIndex;
 
     for (const c of session.cards) {
       c.style.transform = "";
     }
 
-    if (targetIndex !== session.initialIndex) {
+    if (didDrop && targetIndex !== session.initialIndex) {
       const currentChildren = Array.from(cardsContainer.children);
       const refNode = currentChildren[targetIndex > session.initialIndex ? targetIndex + 1 : targetIndex];
       cardsContainer.insertBefore(session.cardEl, refNode || null);
-
-      commitCardOrder();
     }
 
+    const pending = pendingSessionsUpdate;
+    pendingSessionsUpdate = null;
+    if (pending) currentSessions = pending;
+    if (didDrop && targetIndex !== session.initialIndex &&
+        currentSessions.some((item) => item.tabId === session.tabId)) {
+      commitCardOrder();
+    }
     isReorderingCards = false;
-
-    if (pendingSessionsUpdate) {
-      const pending = pendingSessionsUpdate;
-      pendingSessionsUpdate = null;
-      updateSessionsView(pending);
+    if (pending || (didDrop && targetIndex !== session.initialIndex)) {
+      updateSessionsView(currentSessions);
     }
   };
 
@@ -442,6 +460,7 @@ function createCardDom(session: Session): CardDom {
       target.closest(".slider-container") ||
       target.closest(".chapter-section") ||
       target.closest(".volume-section") ||
+      target.closest(".card-toolbar") ||
       target.closest(".card-drag-handle")
     ) {
       return;
@@ -541,10 +560,12 @@ function createCardDom(session: Session): CardDom {
     const updated = currentSessions.map((item) =>
       item.tabId === cardDom.session.tabId ? { ...item, pinned } : item
     );
-    updateSessionsView([
+    const updatedOrder = [
       ...updated.filter((item) => item.pinned),
       ...updated.filter((item) => !item.pinned)
-    ]);
+    ];
+    preferredCardOrder = updatedOrder.map((item) => item.tabId);
+    updateSessionsView(updatedOrder);
     port?.postMessage({ type: "pin", tabId: cardDom.session.tabId, pinned } as PopupToBgMessage);
   });
 
@@ -605,18 +626,18 @@ function createCardDom(session: Session): CardDom {
       sendCommand(current.tabId, current.frameId, {
         action: isPlaying ? "pause" : "play"
       });
+      const isSpotify = current.hostname === "open.spotify.com";
       const pending: NonNullable<CardDom["pendingPlayback"]> = {
         state: requestedState,
-        expiresAt: Date.now() + 2500
+        // Spotify can report the old state after its control has already
+        // reacted. Keep the clicked icon until its new state stays settled.
+        expiresAt: Date.now() + (isSpotify ? 2500 : 900),
+        confirmedAt: null,
+        settleMs: isSpotify ? 500 : 0
       };
       cardDom.pendingPlayback = pending;
       updatePlayButton(cardDom);
-      window.setTimeout(() => {
-        if (cardDom.pendingPlayback === pending) {
-          cardDom.pendingPlayback = null;
-          updatePlayButton(cardDom);
-        }
-      }, 2500);
+      window.setTimeout(() => reconcilePendingPlayback(cardDom, pending), 100);
     }
   });
 
@@ -942,10 +963,10 @@ function createCardDom(session: Session): CardDom {
     e.stopPropagation();
   });
 
-  cardEl.appendChild(volumeBtn);
-  cardEl.appendChild(chapterBtn);
-  cardEl.appendChild(pinBtn);
-  cardEl.appendChild(dragHandle);
+  const cardToolbar = document.createElement("div");
+  cardToolbar.className = "card-toolbar";
+  cardToolbar.append(chapterBtn, volumeBtn, pinBtn, dragHandle);
+  cardEl.appendChild(cardToolbar);
   cardEl.appendChild(topRowEl);
   cardEl.appendChild(bottomRowEl);
   cardEl.appendChild(volumeSection);
@@ -1242,6 +1263,33 @@ function updatePlayButton(card: CardDom) {
   }
 }
 
+function reconcilePendingPlayback(
+  card: CardDom,
+  pending: NonNullable<CardDom["pendingPlayback"]>
+) {
+  if (card.pendingPlayback !== pending) return;
+
+  const now = Date.now();
+  if (card.session.state?.playbackState === pending.state) {
+    pending.confirmedAt ??= now;
+    if (now - pending.confirmedAt >= pending.settleMs) {
+      card.pendingPlayback = null;
+      updatePlayButton(card);
+      return;
+    }
+  } else {
+    pending.confirmedAt = null;
+    if (now >= pending.expiresAt) {
+      // The page did not confirm the command. Restore its reported state.
+      card.pendingPlayback = null;
+      updatePlayButton(card);
+      return;
+    }
+  }
+
+  window.setTimeout(() => reconcilePendingPlayback(card, pending), 100);
+}
+
 function applySliderPosition(card: CardDom, pos: number, duration: number) {
   card.lastInterpolatedPos = pos;
   updateActiveChapter(card);
@@ -1440,14 +1488,29 @@ function updateSessionsView(sessions: Session[]) {
     return;
   }
 
-  if (sessions.length === 0) {
-    currentSessions = [];
-    renderEmptyState();
+  if (isReorderingCards) {
+    pendingSessionsUpdate = sessions;
     return;
   }
 
-  if (isReorderingCards) {
-    pendingSessionsUpdate = sessions;
+  if (preferredCardOrder) {
+    // A state push may have been queued before the background processed the
+    // reorder. Merge its fresh card data without restoring its stale order.
+    const rank = new Map(preferredCardOrder.map((tabId, index) => [tabId, index]));
+    const newSessions = sessions.filter((session) => !rank.has(session.tabId));
+    const existingSessions = sessions.filter((session) => rank.has(session.tabId));
+    existingSessions.sort((a, b) => rank.get(a.tabId)! - rank.get(b.tabId)!);
+    const ordered = [...newSessions, ...existingSessions];
+    sessions = [
+      ...ordered.filter((session) => session.pinned),
+      ...ordered.filter((session) => !session.pinned)
+    ];
+    preferredCardOrder = sessions.map((session) => session.tabId);
+  }
+
+  if (sessions.length === 0) {
+    currentSessions = [];
+    renderEmptyState();
     return;
   }
 
@@ -1679,8 +1742,7 @@ async function initPopup() {
       connection.onMessage.addListener((rawMsg: any) => {
         const msg = rawMsg as BgToPopupMessage;
         if (msg.type === "sessions") {
-          currentSessions = msg.sessions;
-          updateSessionsView(currentSessions);
+          updateSessionsView(msg.sessions);
           if (currentSessions.length === 0) void showAudibleFallback();
         } else if (msg.type === "chapters") {
           const card = renderedCards.get(msg.tabId);

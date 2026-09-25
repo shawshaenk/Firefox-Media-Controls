@@ -49,5 +49,7 @@ export function createIcon(name: IconName): SVGSVGElement {
 }
 
 export function setIcon(container: HTMLElement, name: IconName) {
+  if (container.dataset.icon === name) return;
   container.replaceChildren(createIcon(name));
+  container.dataset.icon = name;
 }

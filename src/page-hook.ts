@@ -46,6 +46,7 @@ import type {
   const trackedAudioContexts = new Set<WeakRef<AudioContext>>();
   const suspendedByUs = new WeakSet<AudioContext>();
   const elementsPlayedWithAudio = new WeakSet<HTMLMediaElement>();
+  const pausedByUs = new Set<WeakRef<HTMLMediaElement>>();
 
   let lastPausedElement: WeakRef<HTMLMediaElement> | null = null;
   let lastPausedTime = 0;
@@ -1490,9 +1491,10 @@ import type {
       } catch (_) {
         return false;
       }
-    } else if (followsOpposite) {
-      // Spotify can update its button after the preceding command returns.
-      // Wait for that transition, then apply this latest requested state once.
+    } else {
+      // The button already offers the opposite action, which usually means the
+      // requested state was reached. It can also be a stale label after a
+      // recent command, so watch for the button to catch up before acting.
       const generation = spotifyPlaybackGeneration;
       let checks = 0;
       const reconcile = () => {
@@ -1502,11 +1504,37 @@ import type {
           try { current.button.click(); } catch (_) {}
           return;
         }
-        if (++checks < 8) window.setTimeout(reconcile, 150);
+        if (++checks < 16) window.setTimeout(reconcile, 80);
       };
-      window.setTimeout(reconcile, 150);
+      window.setTimeout(reconcile, followsOpposite ? 40 : 80);
     }
     return true;
+  }
+
+  function pausePlayingElements(): boolean {
+    let pausedAny = false;
+    for (const el of pruneAndGetElements()) {
+      if (isInlinePreviewElement(el) || el.paused || el.ended) continue;
+      try {
+        el.pause();
+        if (el.paused) {
+          pausedByUs.add(new WeakRef(el));
+          pausedAny = true;
+        }
+      } catch (_) {}
+    }
+    return pausedAny;
+  }
+
+  function resumeElementsPausedByUs(): boolean {
+    let resumedAny = false;
+    for (const ref of pausedByUs) {
+      pausedByUs.delete(ref);
+      const el = ref.deref();
+      if (!el || el.ended || !el.paused || isInlinePreviewElement(el)) continue;
+      resumedAny = tryPlayElement(el) || resumedAny;
+    }
+    return resumedAny;
   }
 
   function playYouTubeOnce(preferElement = false, forcePlay = false): boolean {
@@ -1574,6 +1602,9 @@ import type {
       window.location &&
       (window.location.hostname.includes("youtube.com") ||
         window.location.hostname.includes("youtu.be"));
+    const isSpotifyTopFrame = window.location.hostname === "open.spotify.com" && window.top === window;
+    const isPanoptoViewer = /\.panopto\.com$/i.test(window.location.hostname) &&
+      /\/panopto\/pages\/(?:viewer|embed)\.aspx$/i.test(window.location.pathname);
 
     if (cmd.action === "nexttrack") {
       const handled = playNextTrack();
@@ -1599,7 +1630,7 @@ import type {
       lastPlaybackCommandAt = Date.now();
       const candidate = activePrimaryElement ||
         pruneAndGetElements().find((el) => !isInlinePreviewElement(el)) || null;
-      if (!hasConfirmedPlayback &&
+      if (!hasConfirmedPlayback && !isSpotifyTopFrame &&
           (autoplayBlocked || isAutoplayDenied(candidate) === true)) {
         setAutoplayBlocked(true);
         evaluatePrimaryMedia();
@@ -1641,13 +1672,25 @@ import type {
             }
           }, followsRecentPause ? 100 : 400);
         }
-      } else if (state?.source === "webaudio" && activeAudioContext) {
+      } else if (isSpotifyTopFrame) {
+        // Spotify's Media Session handler can return without changing the
+        // player. Use its own play/pause control as the authoritative path.
+        handled = controlSpotifyPlayback("play", followsRecentPause);
+      } else if (isPanoptoViewer) {
+        const button = findClickableButton(PLAY_SELECTORS);
+        if (button && isPlayStateButton(button)) {
+          simulateClick(button);
+          handled = true;
+        }
+      }
+      if (!handled && state?.source === "webaudio" && activeAudioContext) {
         try {
           activeAudioContext.resume().catch(() => {});
           suspendedByUs.delete(activeAudioContext);
           handled = true;
         } catch (_) {}
-      } else if (handlers["play"]) {
+      }
+      if (!handled && handlers["play"]) {
         try {
           handlers["play"].call(navigator.mediaSession, { action: "play" });
           handled = true;
@@ -1655,7 +1698,7 @@ import type {
           console.warn("[MediaControls] MediaSession play handler threw:", err);
         }
       }
-      if (!handled) handled = controlSpotifyPlayback("play", followsRecentPause);
+      if (!handled) handled = resumeElementsPausedByUs();
       if (!handled && el) handled = !el.paused && !el.ended ? true : tryPlayElement(el);
       if (!handled) {
         const button = findClickableButton(PLAY_SELECTORS);
@@ -1663,6 +1706,22 @@ import type {
           simulateClick(button);
           handled = true;
         }
+      }
+      if (handled && !isYouTube && !isSpotifyTopFrame) {
+        // A handler or site button returning is not proof that playback began.
+        // If it was a no-op, resume only the media this extension paused.
+        window.setTimeout(() => {
+          if (gen !== ytPlayGeneration || autoplayBlocked) return;
+          const anyPlaying = pruneAndGetElements().some((candidate) =>
+            !isInlinePreviewElement(candidate) && !candidate.paused && !candidate.ended);
+          const resumed = resumeElementsPausedByUs();
+          if (!anyPlaying && !resumed && el?.paused) {
+            tryPlayElement(el);
+          }
+          if (resumed || !anyPlaying) {
+            scheduleEvaluation();
+          }
+        }, 200);
       }
 
       scheduleEvaluation();
@@ -1692,9 +1751,9 @@ import type {
       spotifyPlaybackGeneration++;
       lastPlaybackCommand = "pause";
       lastPlaybackCommandAt = Date.now();
-      sessionPlaybackState = "paused";
       // A pause cancels any pending cold-play retries.
       ytPlayGeneration++;
+      const gen = ytPlayGeneration;
       pendingColdPlayUntil = 0;
       let handled = false;
 
@@ -1721,6 +1780,16 @@ import type {
           }
         } catch (_) {}
       }
+      if (!handled && isSpotifyTopFrame) {
+        handled = controlSpotifyPlayback("pause", followsRecentPlay);
+      }
+      if (!handled && isPanoptoViewer) {
+        const button = findClickableButton(PAUSE_SELECTORS);
+        if (button && isPauseStateButton(button)) {
+          simulateClick(button);
+          handled = true;
+        }
+      }
       if (!handled && state?.source === "webaudio" && activeAudioContext) {
         try {
           activeAudioContext.suspend().catch(() => {});
@@ -1737,19 +1806,23 @@ import type {
         }
       }
 
-      if (!handled) handled = controlSpotifyPlayback("pause", followsRecentPlay);
-
-      if (!handled && el) {
-        try {
-          el.pause();
-          handled = true;
-        } catch (_) {}
-      }
+      if (!handled) handled = pausePlayingElements();
       if (!handled) {
         const button = findClickableButton(PAUSE_SELECTORS);
         if (button && isPauseStateButton(button)) {
           simulateClick(button);
           handled = true;
+        }
+      }
+      if (handled && !isYouTube && !isSpotifyTopFrame && elements.length > 0) {
+        // Sites may ignore a Media Session handler or keep a second stream
+        // running. Pause every remaining playing element, including muted
+        // companion video in a multi-stream viewer such as Panopto.
+        for (const delay of [180, 500]) {
+          window.setTimeout(() => {
+            if (gen !== ytPlayGeneration) return;
+            if (pausePlayingElements()) scheduleEvaluation();
+          }, delay);
         }
       }
 

@@ -145,22 +145,41 @@ scrollbar {
   cursor: grabbing !important;
 }
 
-/* Drag Handle */
-.card-drag-handle {
+/* Card toolbar */
+.card-toolbar {
   position: absolute;
   top: 10px;
   right: 12px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  z-index: 2;
+}
+
+.card-drag-handle,
+.card-pin-btn,
+.card-chapters-btn,
+.card-volume-btn {
   width: 24px;
   height: 24px;
+  flex: 0 0 24px;
   display: flex;
   align-items: center;
   justify-content: center;
-  color: var(--control-icon);
-  cursor: grab !important;
+  padding: 0;
+  border: none;
   border-radius: 4px;
+  background: transparent;
+  color: var(--control-icon);
+  line-height: 0;
+}
+
+/* Drag Handle */
+.card-drag-handle {
+  cursor: grab !important;
   transition: background-color 0.15s ease;
-  z-index: 2;
   user-select: none;
+  touch-action: none;
 }
 
 .card-drag-handle:hover {
@@ -178,40 +197,10 @@ scrollbar {
   outline-offset: 1px;
 }
 
-.card-drag-handle svg {
-  width: 18px;
-  height: 18px;
-  pointer-events: none;
-}
-
 .card-pin-btn,
 .card-chapters-btn,
 .card-volume-btn {
-  position: absolute;
-  top: 10px;
-  width: 24px;
-  height: 24px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  border: none;
-  border-radius: 4px;
-  background: transparent;
-  color: var(--control-icon);
   cursor: pointer;
-  z-index: 2;
-}
-
-.card-pin-btn {
-  right: 40px;
-}
-
-.card-volume-btn {
-  right: 64px;
-}
-
-.card-chapters-btn {
-  right: 88px;
 }
 
 .card-chapters-btn[hidden] {
@@ -251,11 +240,13 @@ scrollbar {
   outline-offset: 1px;
 }
 
+.card-drag-handle svg,
 .card-pin-btn svg,
 .card-chapters-btn svg,
 .card-volume-btn svg {
-  width: 17px;
-  height: 17px;
+  display: block;
+  width: 18px;
+  height: 18px;
   pointer-events: none;
 }
 
@@ -326,6 +317,7 @@ scrollbar {
   align-items: center;
   gap: 6px;
   min-width: 0;
+  padding-right: 36px;
   height: 16px;
   line-height: 16px;
 }

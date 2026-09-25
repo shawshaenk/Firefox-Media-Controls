@@ -1252,10 +1252,12 @@ browser.runtime.onConnect.addListener((port) => {
         const routeCommand = async () => {
           const frameId = msg.frameId ?? 0;
           let preferredFrameId = frameId;
+          let isSpotifyTab = false;
           if (msg.cmd.action === "play" || msg.cmd.action === "pause") {
             try {
               const url = new URL(tabsInfo.get(msg.tabId)?.url || "");
-              if (url.hostname === "open.spotify.com") preferredFrameId = 0;
+              isSpotifyTab = url.hostname === "open.spotify.com";
+              if (isSpotifyTab) preferredFrameId = 0;
             } catch (_) {}
           }
           const relayMsg: BgToRelayMessage = {
@@ -1289,6 +1291,15 @@ browser.runtime.onConnect.addListener((port) => {
           if (!handled && frameId !== 0 &&
               (msg.cmd.action === "nexttrack" || msg.cmd.action === "previoustrack")) {
             browser.tabs.sendMessage(msg.tabId, relayMsg, { frameId: 0 }).catch(() => {});
+          }
+          if (msg.cmd.action === "pause" && !isSpotifyTab) {
+            // One card represents the whole tab. Viewers with synchronized
+            // streams can report playing media from more than one frame.
+            const otherPlayingFrames = Array.from(registry.get(msg.tabId) || [])
+              .filter(([id, state]) => id !== frameId && state.playbackState === "playing")
+              .map(([id]) => id);
+            await Promise.allSettled(otherPlayingFrames.map((id) =>
+              browser.tabs.sendMessage(msg.tabId, relayMsg, { frameId: id })));
           }
         };
         if (msg.cmd.action === "play" || msg.cmd.action === "pause") {

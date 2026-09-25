@@ -35,6 +35,7 @@
     const trackedAudioContexts = /* @__PURE__ */ new Set();
     const suspendedByUs = /* @__PURE__ */ new WeakSet();
     const elementsPlayedWithAudio = /* @__PURE__ */ new WeakSet();
+    const pausedByUs = /* @__PURE__ */ new Set();
     let lastPausedElement = null;
     let lastPausedTime = 0;
     let lastPlayedAtEpoch = Date.now();
@@ -1208,7 +1209,7 @@
         } catch (_) {
           return false;
         }
-      } else if (followsOpposite) {
+      } else {
         const generation = spotifyPlaybackGeneration;
         let checks = 0;
         const reconcile = () => {
@@ -1221,11 +1222,36 @@
             }
             return;
           }
-          if (++checks < 8) window.setTimeout(reconcile, 150);
+          if (++checks < 16) window.setTimeout(reconcile, 80);
         };
-        window.setTimeout(reconcile, 150);
+        window.setTimeout(reconcile, followsOpposite ? 40 : 80);
       }
       return true;
+    }
+    function pausePlayingElements() {
+      let pausedAny = false;
+      for (const el of pruneAndGetElements()) {
+        if (isInlinePreviewElement(el) || el.paused || el.ended) continue;
+        try {
+          el.pause();
+          if (el.paused) {
+            pausedByUs.add(new WeakRef(el));
+            pausedAny = true;
+          }
+        } catch (_) {
+        }
+      }
+      return pausedAny;
+    }
+    function resumeElementsPausedByUs() {
+      let resumedAny = false;
+      for (const ref of pausedByUs) {
+        pausedByUs.delete(ref);
+        const el = ref.deref();
+        if (!el || el.ended || !el.paused || isInlinePreviewElement(el)) continue;
+        resumedAny = tryPlayElement(el) || resumedAny;
+      }
+      return resumedAny;
     }
     function playYouTubeOnce(preferElement = false, forcePlay = false) {
       const el = activePrimaryElement || pruneAndGetElements().find((candidate) => !isInlinePreviewElement(candidate)) || document.querySelector("video, audio");
@@ -1281,6 +1307,8 @@
     function executeCommand(cmd) {
       const state = currentFrameState;
       const isYouTube = typeof window !== "undefined" && window.location && (window.location.hostname.includes("youtube.com") || window.location.hostname.includes("youtu.be"));
+      const isSpotifyTopFrame = window.location.hostname === "open.spotify.com" && window.top === window;
+      const isPanoptoViewer = /\.panopto\.com$/i.test(window.location.hostname) && /\/panopto\/pages\/(?:viewer|embed)\.aspx$/i.test(window.location.pathname);
       if (cmd.action === "nexttrack") {
         const handled = playNextTrack();
         scheduleEvaluation();
@@ -1301,7 +1329,7 @@
         lastPlaybackCommand = "play";
         lastPlaybackCommandAt = Date.now();
         const candidate = activePrimaryElement || pruneAndGetElements().find((el2) => !isInlinePreviewElement(el2)) || null;
-        if (!hasConfirmedPlayback && (autoplayBlocked || isAutoplayDenied(candidate) === true)) {
+        if (!hasConfirmedPlayback && !isSpotifyTopFrame && (autoplayBlocked || isAutoplayDenied(candidate) === true)) {
           setAutoplayBlocked(true);
           evaluatePrimaryMedia();
           return false;
@@ -1331,7 +1359,16 @@
               }
             }, followsRecentPause ? 100 : 400);
           }
-        } else if (state?.source === "webaudio" && activeAudioContext) {
+        } else if (isSpotifyTopFrame) {
+          handled = controlSpotifyPlayback("play", followsRecentPause);
+        } else if (isPanoptoViewer) {
+          const button = findClickableButton(PLAY_SELECTORS);
+          if (button && isPlayStateButton(button)) {
+            simulateClick(button);
+            handled = true;
+          }
+        }
+        if (!handled && state?.source === "webaudio" && activeAudioContext) {
           try {
             activeAudioContext.resume().catch(() => {
             });
@@ -1339,7 +1376,8 @@
             handled = true;
           } catch (_) {
           }
-        } else if (handlers["play"]) {
+        }
+        if (!handled && handlers["play"]) {
           try {
             handlers["play"].call(navigator.mediaSession, { action: "play" });
             handled = true;
@@ -1347,7 +1385,7 @@
             console.warn("[MediaControls] MediaSession play handler threw:", err);
           }
         }
-        if (!handled) handled = controlSpotifyPlayback("play", followsRecentPause);
+        if (!handled) handled = resumeElementsPausedByUs();
         if (!handled && el) handled = !el.paused && !el.ended ? true : tryPlayElement(el);
         if (!handled) {
           const button = findClickableButton(PLAY_SELECTORS);
@@ -1355,6 +1393,19 @@
             simulateClick(button);
             handled = true;
           }
+        }
+        if (handled && !isYouTube && !isSpotifyTopFrame) {
+          window.setTimeout(() => {
+            if (gen !== ytPlayGeneration || autoplayBlocked) return;
+            const anyPlaying = pruneAndGetElements().some((candidate2) => !isInlinePreviewElement(candidate2) && !candidate2.paused && !candidate2.ended);
+            const resumed = resumeElementsPausedByUs();
+            if (!anyPlaying && !resumed && el?.paused) {
+              tryPlayElement(el);
+            }
+            if (resumed || !anyPlaying) {
+              scheduleEvaluation();
+            }
+          }, 200);
         }
         scheduleEvaluation();
         setTimeout(scheduleEvaluation, 100);
@@ -1379,8 +1430,8 @@
         spotifyPlaybackGeneration++;
         lastPlaybackCommand = "pause";
         lastPlaybackCommandAt = Date.now();
-        sessionPlaybackState = "paused";
         ytPlayGeneration++;
+        const gen = ytPlayGeneration;
         pendingColdPlayUntil = 0;
         let handled = false;
         const elements = pruneAndGetElements().filter((el2) => !isInlinePreviewElement(el2));
@@ -1392,9 +1443,9 @@
               yt.pauseVideo();
               handled = true;
               if (el) {
-                const gen = ytPlayGeneration;
+                const gen2 = ytPlayGeneration;
                 window.setTimeout(() => {
-                  if (gen === ytPlayGeneration && !el.paused) {
+                  if (gen2 === ytPlayGeneration && !el.paused) {
                     try {
                       el.pause();
                     } catch (_) {
@@ -1405,6 +1456,16 @@
               }
             }
           } catch (_) {
+          }
+        }
+        if (!handled && isSpotifyTopFrame) {
+          handled = controlSpotifyPlayback("pause", followsRecentPlay);
+        }
+        if (!handled && isPanoptoViewer) {
+          const button = findClickableButton(PAUSE_SELECTORS);
+          if (button && isPauseStateButton(button)) {
+            simulateClick(button);
+            handled = true;
           }
         }
         if (!handled && state?.source === "webaudio" && activeAudioContext) {
@@ -1424,19 +1485,20 @@
             console.warn("[MediaControls] MediaSession pause handler threw:", err);
           }
         }
-        if (!handled) handled = controlSpotifyPlayback("pause", followsRecentPlay);
-        if (!handled && el) {
-          try {
-            el.pause();
-            handled = true;
-          } catch (_) {
-          }
-        }
+        if (!handled) handled = pausePlayingElements();
         if (!handled) {
           const button = findClickableButton(PAUSE_SELECTORS);
           if (button && isPauseStateButton(button)) {
             simulateClick(button);
             handled = true;
+          }
+        }
+        if (handled && !isYouTube && !isSpotifyTopFrame && elements.length > 0) {
+          for (const delay of [180, 500]) {
+            window.setTimeout(() => {
+              if (gen !== ytPlayGeneration) return;
+              if (pausePlayingElements()) scheduleEvaluation();
+            }, delay);
           }
         }
         scheduleEvaluation();
