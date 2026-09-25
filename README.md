@@ -38,21 +38,21 @@ Build the XPI, then load it as a temporary add-on:
 2. Install the Python dependency and run `npm ci` as shown below.
 3. Run `npm run package`.
 4. In Firefox, open `about:debugging#/runtime/this-firefox`.
-5. Choose **Load Temporary Add-on** and select the XPI in `dist` (currently `dist/media-controls-1.0.1.xpi`).
+5. Choose **Load Temporary Add-on** and select the XPI in `dist` (currently `dist/media-controls-1.0.2.xpi`).
 
 Temporary add-ons must be loaded again after restarting Firefox. This locally built XPI is not signed for permanent installation from the Add-ons Manager.
 
 ## Build from source for Mozilla reviewers
 
-The source archive for submission is `media-controls-source-1.0.1.zip`. It contains the original TypeScript, HTML, CSS, manifest, build scripts, lockfile, and icon generator. It excludes generated JavaScript, copied popup files, generated PNG icons, dependencies, and the XPI. The build produces the same add-on files as the submitted XPI.
+The source archive for submission is `media-controls-source-1.0.2.zip`. It contains the original TypeScript, HTML, CSS, manifest, build scripts, lockfile, and icon generator. It excludes generated JavaScript, copied popup files, generated PNG icons, dependencies, and the XPI. The build produces the same add-on files as the submitted XPI.
 
 The build was made on **Fedora Linux 44, x86_64**. Install **Node.js 24.18.0** from the Node.js distribution or a Node version manager, then install **npm 11.16.0** with `npm install -g npm@11.16.0`. Install **Python 3.14.7** with `pip` and `venv` from the Python distribution or your OS package manager. Confirm the installed versions with `node --version`, `npm --version`, and `python3 --version`. Internet access is needed for the dependency installation. No browser is needed to build the XPI.
 
 Extract the source archive, then run these commands from the directory containing the archive:
 
 ```sh
-unzip media-controls-source-1.0.1.zip
-cd media-controls-source-1.0.1
+unzip media-controls-source-1.0.2.zip
+cd media-controls-source-1.0.2
 python3 -m venv .venv
 . .venv/bin/activate
 python3 -m pip install -r requirements-build.txt
@@ -60,7 +60,7 @@ npm ci
 npm run package
 ```
 
-The Python requirements file pins **Pillow 12.3.0**. `npm ci` installs the exact JavaScript dependency versions in `package-lock.json`, including esbuild and TypeScript. `npm run package` generates the toolbar PNGs at 16, 32, 48, 64, and 128 pixels, copies the popup HTML and CSS, bundles the TypeScript entry points, and creates `dist/media-controls-1.0.1.xpi` using `scripts/package.py`. The XPI contains only the runtime files listed in that packaging script. Source maps are generated for local development but are not included in the XPI.
+The Python requirements file pins **Pillow 12.3.0**. `npm ci` installs the exact JavaScript dependency versions in `package-lock.json`, including esbuild and TypeScript. `npm run package` generates the toolbar PNGs at 16, 32, 48, 64, and 128 pixels, copies the popup HTML and CSS, bundles the TypeScript entry points, and creates `dist/media-controls-1.0.2.xpi` using `scripts/package.py`. The XPI contains only the runtime files listed in that packaging script. Source maps are generated for local development but are not included in the XPI.
 
 ## Build and development
 
