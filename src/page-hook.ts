@@ -64,6 +64,7 @@ import type {
   let ytPlayGeneration = 0;
   let lastPlaybackCommand: "play" | "pause" | null = null;
   let lastPlaybackCommandAt = 0;
+  let spotifyPlaybackGeneration = 0;
   // True once the browser's autoplay policy has rejected programmatic play
   // (NotAllowedError on both audible and muted attempts, or an exhausted
   // YouTube retry loop). Cleared on real playback or real user interaction.
@@ -1470,6 +1471,44 @@ import type {
     return true;
   }
 
+  function spotifyPlaybackButton(): { button: HTMLButtonElement; action: "play" | "pause" } | null {
+    if (window.location.hostname !== "open.spotify.com" || window.top !== window) return null;
+    const button = document.querySelector<HTMLButtonElement>('button[data-testid="control-button-playpause"]');
+    if (!button || button.disabled || button.getAttribute("aria-disabled") === "true") return null;
+    const label = (button.getAttribute("aria-label") || "").toLowerCase();
+    if (/\bpause\b/.test(label) && !/\bplay\b/.test(label)) return { button, action: "pause" };
+    if (/\bplay\b/.test(label) && !/\bpause\b/.test(label)) return { button, action: "play" };
+    return null;
+  }
+
+  function controlSpotifyPlayback(action: "play" | "pause", followsOpposite: boolean): boolean {
+    const control = spotifyPlaybackButton();
+    if (!control) return false;
+    if (control.action === action) {
+      try {
+        control.button.click();
+      } catch (_) {
+        return false;
+      }
+    } else if (followsOpposite) {
+      // Spotify can update its button after the preceding command returns.
+      // Wait for that transition, then apply this latest requested state once.
+      const generation = spotifyPlaybackGeneration;
+      let checks = 0;
+      const reconcile = () => {
+        if (generation !== spotifyPlaybackGeneration) return;
+        const current = spotifyPlaybackButton();
+        if (current?.action === action) {
+          try { current.button.click(); } catch (_) {}
+          return;
+        }
+        if (++checks < 8) window.setTimeout(reconcile, 150);
+      };
+      window.setTimeout(reconcile, 150);
+    }
+    return true;
+  }
+
   function playYouTubeOnce(preferElement = false, forcePlay = false): boolean {
     const el = activePrimaryElement ||
       pruneAndGetElements().find((candidate) => !isInlinePreviewElement(candidate)) ||
@@ -1555,6 +1594,7 @@ import type {
     if (cmd.action === "play") {
       const followsRecentPause = lastPlaybackCommand === "pause" &&
         Date.now() - lastPlaybackCommandAt < 1000;
+      spotifyPlaybackGeneration++;
       lastPlaybackCommand = "play";
       lastPlaybackCommandAt = Date.now();
       const candidate = activePrimaryElement ||
@@ -1607,8 +1647,6 @@ import type {
           suspendedByUs.delete(activeAudioContext);
           handled = true;
         } catch (_) {}
-      } else if (!followsRecentPause && el && !el.paused && !el.ended) {
-        handled = true;
       } else if (handlers["play"]) {
         try {
           handlers["play"].call(navigator.mediaSession, { action: "play" });
@@ -1617,7 +1655,8 @@ import type {
           console.warn("[MediaControls] MediaSession play handler threw:", err);
         }
       }
-      if (!handled && el) handled = tryPlayElement(el);
+      if (!handled) handled = controlSpotifyPlayback("play", followsRecentPause);
+      if (!handled && el) handled = !el.paused && !el.ended ? true : tryPlayElement(el);
       if (!handled) {
         const button = findClickableButton(PLAY_SELECTORS);
         if (button && isPlayStateButton(button)) {
@@ -1648,6 +1687,9 @@ import type {
     }
 
     if (cmd.action === "pause") {
+      const followsRecentPlay = lastPlaybackCommand === "play" &&
+        Date.now() - lastPlaybackCommandAt < 1000;
+      spotifyPlaybackGeneration++;
       lastPlaybackCommand = "pause";
       lastPlaybackCommandAt = Date.now();
       sessionPlaybackState = "paused";
@@ -1694,6 +1736,8 @@ import type {
           console.warn("[MediaControls] MediaSession pause handler threw:", err);
         }
       }
+
+      if (!handled) handled = controlSpotifyPlayback("pause", followsRecentPlay);
 
       if (!handled && el) {
         try {

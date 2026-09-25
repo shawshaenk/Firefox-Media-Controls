@@ -900,6 +900,7 @@
     card.chapterBtn.classList.toggle("is-open", open);
     card.chapterBtn.setAttribute("aria-expanded", String(open));
     updateChaptersButton(card);
+    if (open) scrollToActiveChapter(card);
   }
   function updateChaptersButton(card) {
     const btn = card.chapterBtn;
@@ -954,6 +955,20 @@
       else row.removeAttribute("aria-current");
     });
   }
+  function scrollToActiveChapter(card) {
+    if (!card.chaptersOpen || card.chapters.length === 0) return;
+    updateActiveChapter(card);
+    const list = card.chapterList;
+    const row = list.querySelectorAll(".chapter-row")[card.activeChapterIndex];
+    if (!row) {
+      list.scrollTop = 0;
+      return;
+    }
+    const listRect = list.getBoundingClientRect();
+    const rowRect = row.getBoundingClientRect();
+    const rowTop = rowRect.top - listRect.top + list.scrollTop;
+    list.scrollTop = rowTop - (list.clientHeight - rowRect.height) / 2;
+  }
   function renderChapters(card, videoId, chapters) {
     card.chapterVideoId = videoId;
     card.chapters = chapters;
@@ -990,7 +1005,7 @@
       return row;
     });
     card.chapterList.replaceChildren(...rows);
-    updateActiveChapter(card);
+    scrollToActiveChapter(card);
   }
   function updatePlayButton(card) {
     const session = card.session;
@@ -1070,7 +1085,7 @@
       card.activeChapterIndex = -1;
       card.chapterList.replaceChildren();
     }
-    if (card.pendingPlayback && (session.frameId !== card.session.frameId || session.degraded || session.state?.playBlocked && card.pendingPlayback.state === "playing" || session.state?.playbackState === card.pendingPlayback.state)) {
+    if (card.pendingPlayback && (session.frameId !== card.session.frameId && session.hostname !== "open.spotify.com" || session.degraded || session.state?.playBlocked && card.pendingPlayback.state === "playing")) {
       card.pendingPlayback = null;
     }
     if (card.pendingSeek) {

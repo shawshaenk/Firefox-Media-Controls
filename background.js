@@ -1180,23 +1180,37 @@
           }
           const routeCommand = async () => {
             const frameId = msg.frameId ?? 0;
+            let preferredFrameId = frameId;
+            if (msg.cmd.action === "play" || msg.cmd.action === "pause") {
+              try {
+                const url = new URL(tabsInfo.get(msg.tabId)?.url || "");
+                if (url.hostname === "open.spotify.com") preferredFrameId = 0;
+              } catch (_) {
+              }
+            }
             const relayMsg = {
               type: "cmd",
               cmd: msg.cmd
             };
             let handled = false;
             try {
-              handled = await browser.tabs.sendMessage(msg.tabId, relayMsg, { frameId }) === true;
+              handled = await browser.tabs.sendMessage(msg.tabId, relayMsg, { frameId: preferredFrameId }) === true;
             } catch (err) {
               if (msg.cmd.action === "play" || msg.cmd.action === "pause") {
                 await injectScriptsIntoTab(msg.tabId);
                 try {
-                  handled = await browser.tabs.sendMessage(msg.tabId, relayMsg, { frameId }) === true;
+                  handled = await browser.tabs.sendMessage(msg.tabId, relayMsg, { frameId: preferredFrameId }) === true;
                 } catch (retryErr) {
                   console.warn("[MediaControls Background] Failed to send cmd to frame:", retryErr);
                 }
               } else {
                 console.warn("[MediaControls Background] Failed to send cmd to frame:", err);
+              }
+            }
+            if (!handled && preferredFrameId !== frameId) {
+              try {
+                handled = await browser.tabs.sendMessage(msg.tabId, relayMsg, { frameId }) === true;
+              } catch (_) {
               }
             }
             if (!handled && frameId !== 0 && (msg.cmd.action === "nexttrack" || msg.cmd.action === "previoustrack")) {

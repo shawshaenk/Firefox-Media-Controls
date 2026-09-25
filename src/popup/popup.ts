@@ -1081,6 +1081,7 @@ function setChaptersOpen(card: CardDom, open: boolean) {
   card.chapterBtn.classList.toggle("is-open", open);
   card.chapterBtn.setAttribute("aria-expanded", String(open));
   updateChaptersButton(card);
+  if (open) scrollToActiveChapter(card);
 }
 
 // Sets the chapter button label, tooltip, and disabled appearance from the
@@ -1153,6 +1154,22 @@ function updateActiveChapter(card: CardDom) {
   });
 }
 
+function scrollToActiveChapter(card: CardDom) {
+  if (!card.chaptersOpen || card.chapters.length === 0) return;
+  updateActiveChapter(card);
+  const list = card.chapterList;
+  const row = list.querySelectorAll<HTMLButtonElement>(".chapter-row")[card.activeChapterIndex];
+  if (!row) {
+    list.scrollTop = 0;
+    return;
+  }
+  // Scroll only the chapter list; scrollIntoView would also move the flyout.
+  const listRect = list.getBoundingClientRect();
+  const rowRect = row.getBoundingClientRect();
+  const rowTop = rowRect.top - listRect.top + list.scrollTop;
+  list.scrollTop = rowTop - (list.clientHeight - rowRect.height) / 2;
+}
+
 function renderChapters(card: CardDom, videoId: string, chapters: YouTubeChapter[]) {
   card.chapterVideoId = videoId;
   card.chapters = chapters;
@@ -1190,7 +1207,7 @@ function renderChapters(card: CardDom, videoId: string, chapters: YouTubeChapter
     return row;
   });
   card.chapterList.replaceChildren(...rows);
-  updateActiveChapter(card);
+  scrollToActiveChapter(card);
 }
 
 function updatePlayButton(card: CardDom) {
@@ -1287,9 +1304,9 @@ function updateCardDom(card: CardDom, session: Session) {
     card.chapterList.replaceChildren();
   }
   if (card.pendingPlayback &&
-      (session.frameId !== card.session.frameId || session.degraded ||
-       (session.state?.playBlocked && card.pendingPlayback.state === "playing") ||
-       session.state?.playbackState === card.pendingPlayback.state)) {
+      ((session.frameId !== card.session.frameId && session.hostname !== "open.spotify.com") ||
+       session.degraded ||
+       (session.state?.playBlocked && card.pendingPlayback.state === "playing"))) {
     card.pendingPlayback = null;
   }
   if (card.pendingSeek) {

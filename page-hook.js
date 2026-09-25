@@ -47,6 +47,7 @@
     let ytPlayGeneration = 0;
     let lastPlaybackCommand = null;
     let lastPlaybackCommandAt = 0;
+    let spotifyPlaybackGeneration = 0;
     let autoplayBlocked = false;
     let hasConfirmedPlayback = false;
     let hadTrustedGesture = false;
@@ -1189,6 +1190,43 @@
       });
       return true;
     }
+    function spotifyPlaybackButton() {
+      if (window.location.hostname !== "open.spotify.com" || window.top !== window) return null;
+      const button = document.querySelector('button[data-testid="control-button-playpause"]');
+      if (!button || button.disabled || button.getAttribute("aria-disabled") === "true") return null;
+      const label = (button.getAttribute("aria-label") || "").toLowerCase();
+      if (/\bpause\b/.test(label) && !/\bplay\b/.test(label)) return { button, action: "pause" };
+      if (/\bplay\b/.test(label) && !/\bpause\b/.test(label)) return { button, action: "play" };
+      return null;
+    }
+    function controlSpotifyPlayback(action, followsOpposite) {
+      const control = spotifyPlaybackButton();
+      if (!control) return false;
+      if (control.action === action) {
+        try {
+          control.button.click();
+        } catch (_) {
+          return false;
+        }
+      } else if (followsOpposite) {
+        const generation = spotifyPlaybackGeneration;
+        let checks = 0;
+        const reconcile = () => {
+          if (generation !== spotifyPlaybackGeneration) return;
+          const current = spotifyPlaybackButton();
+          if (current?.action === action) {
+            try {
+              current.button.click();
+            } catch (_) {
+            }
+            return;
+          }
+          if (++checks < 8) window.setTimeout(reconcile, 150);
+        };
+        window.setTimeout(reconcile, 150);
+      }
+      return true;
+    }
     function playYouTubeOnce(preferElement = false, forcePlay = false) {
       const el = activePrimaryElement || pruneAndGetElements().find((candidate) => !isInlinePreviewElement(candidate)) || document.querySelector("video, audio");
       if (el && !isInlinePreviewElement(el)) {
@@ -1259,6 +1297,7 @@
       }
       if (cmd.action === "play") {
         const followsRecentPause = lastPlaybackCommand === "pause" && Date.now() - lastPlaybackCommandAt < 1e3;
+        spotifyPlaybackGeneration++;
         lastPlaybackCommand = "play";
         lastPlaybackCommandAt = Date.now();
         const candidate = activePrimaryElement || pruneAndGetElements().find((el2) => !isInlinePreviewElement(el2)) || null;
@@ -1300,8 +1339,6 @@
             handled = true;
           } catch (_) {
           }
-        } else if (!followsRecentPause && el && !el.paused && !el.ended) {
-          handled = true;
         } else if (handlers["play"]) {
           try {
             handlers["play"].call(navigator.mediaSession, { action: "play" });
@@ -1310,7 +1347,8 @@
             console.warn("[MediaControls] MediaSession play handler threw:", err);
           }
         }
-        if (!handled && el) handled = tryPlayElement(el);
+        if (!handled) handled = controlSpotifyPlayback("play", followsRecentPause);
+        if (!handled && el) handled = !el.paused && !el.ended ? true : tryPlayElement(el);
         if (!handled) {
           const button = findClickableButton(PLAY_SELECTORS);
           if (button && isPlayStateButton(button)) {
@@ -1337,6 +1375,8 @@
         return handled;
       }
       if (cmd.action === "pause") {
+        const followsRecentPlay = lastPlaybackCommand === "play" && Date.now() - lastPlaybackCommandAt < 1e3;
+        spotifyPlaybackGeneration++;
         lastPlaybackCommand = "pause";
         lastPlaybackCommandAt = Date.now();
         sessionPlaybackState = "paused";
@@ -1384,6 +1424,7 @@
             console.warn("[MediaControls] MediaSession pause handler threw:", err);
           }
         }
+        if (!handled) handled = controlSpotifyPlayback("pause", followsRecentPlay);
         if (!handled && el) {
           try {
             el.pause();
