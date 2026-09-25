@@ -1,9 +1,10 @@
 {
   "name": "firefox-media-controller",
   "version": "1.0.1",
-  "description": "Firefox Global Media Controls Extension",
+  "description": "Chrome Media Controls for Firefox",
   "scripts": {
-    "package": "npm run build && python3 scripts/package.py",
+    "package": "python3 scripts/generate-icons.py && npm run build && python3 scripts/package.py",
+    "package:source": "python3 scripts/package-source.py",
     "build": "node build.js",
     "watch": "node build.js --watch",
     "typecheck": "tsc --noEmit",

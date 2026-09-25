@@ -1,6 +1,6 @@
 {
   "manifest_version": 3,
-  "name": "Media Controls",
+  "name": "Chrome Media Controls",
   "version": "1.0.1",
   "description": "Global media controls panel for tabs playing audio.",
   "browser_specific_settings": {
