@@ -87,6 +87,7 @@
     const seekable = Boolean(state.seekable);
     const lastPlayedAt = typeof state.lastPlayedAt === "number" && isFinite(state.lastPlayedAt) ? Math.min(Date.now(), Math.max(0, state.lastPlayedAt)) : Date.now();
     const playBlocked = state.playBlocked === true;
+    const buffering = state.buffering === true;
     return {
       source,
       metadata: sanitizeMetadata(state.metadata),
@@ -97,7 +98,8 @@
       seekable,
       volume: sanitizeVolume(state.volume),
       lastPlayedAt,
-      playBlocked
+      playBlocked,
+      buffering
     };
   }
   function sanitizeCommand(cmd) {

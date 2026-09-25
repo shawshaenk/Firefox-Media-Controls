@@ -45,6 +45,7 @@ export interface FrameState {
   volume: VolumeState | null; // null when no safe numeric volume control
   lastPlayedAt: number; // epoch ms, for ordering
   playBlocked?: boolean; // true when Firefox denies script initiated playback
+  buffering?: boolean; // true while a previously playing video waits for data
 }
 
 export interface Command {

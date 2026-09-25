@@ -21,6 +21,7 @@ import type {
   const MEDIA_EVENTS = [
     "play",
     "playing",
+    "seeking",
     "pause",
     "ended",
     "seeked",
@@ -46,6 +47,7 @@ import type {
   const trackedAudioContexts = new Set<WeakRef<AudioContext>>();
   const suspendedByUs = new WeakSet<AudioContext>();
   const elementsPlayedWithAudio = new WeakSet<HTMLMediaElement>();
+  const waitingForData = new WeakSet<HTMLMediaElement>();
   const pausedByUs = new Set<WeakRef<HTMLMediaElement>>();
 
   let lastPausedElement: WeakRef<HTMLMediaElement> | null = null;
@@ -57,6 +59,7 @@ import type {
   let currentFrameState: FrameState | null = null;
 
   let evalTimer: number | null = null;
+  let bufferingPollTimer: number | null = null;
   let lastKnownHref = typeof window !== "undefined" && window.location ? window.location.href : "";
   // Cold-play intent: popup asked for play while the YouTube player was still
   // cueing (autoplay off, fresh tab). Retry briefly as the player appears.
@@ -491,6 +494,17 @@ import type {
 
   function postState(state: FrameState | null) {
     currentFrameState = state;
+    if (state?.buffering) {
+      if (bufferingPollTimer === null) {
+        bufferingPollTimer = window.setTimeout(() => {
+          bufferingPollTimer = null;
+          scheduleEvaluation();
+        }, 300);
+      }
+    } else if (bufferingPollTimer !== null) {
+      clearTimeout(bufferingPollTimer);
+      bufferingPollTimer = null;
+    }
     const msg: McxUpMessage = {
       __mcx: "up",
       state
@@ -533,6 +547,17 @@ import type {
     );
 
     const ytVideoId = isYouTube ? getYouTubeVideoId() : null;
+    const ytMedia = audiblePlaying[0] || playingElements[0] || activePrimaryElement || elements[0];
+    let ytPlayerBuffering = false;
+    if (isYouTube) {
+      try { ytPlayerBuffering = getYtPlayer()?.getPlayerState?.() === 3; } catch (_) {}
+    }
+    const buffering = Boolean(
+      isYouTube && ytVideoId && !autoplayBlocked &&
+      (hasConfirmedPlayback || hadTrustedGesture) &&
+      (ytPlayerBuffering || (ytMedia && !ytMedia.ended &&
+        (ytMedia.seeking || waitingForData.has(ytMedia))))
+    );
 
     // RULE 1 (YouTube Non-Watch Pages):
     // On YouTube non-watch pages (Home, Search, Subscriptions, Channel feeds, etc.),
@@ -782,7 +807,8 @@ import type {
         seekable: isSeekable,
         volume: getPrimaryVolumeState(),
         lastPlayedAt: lastPlayedAtEpoch,
-        playBlocked: autoplayBlocked
+        playBlocked: autoplayBlocked,
+        buffering
       });
       return;
     }
@@ -840,7 +866,8 @@ import type {
         seekable,
         volume: getPrimaryVolumeState(),
         lastPlayedAt: lastPlayedAtEpoch,
-        playBlocked: false
+        playBlocked: false,
+        buffering
       });
       return;
     }
@@ -894,7 +921,8 @@ import type {
         seekable,
         volume: getPrimaryVolumeState(),
         lastPlayedAt: lastPlayedAtEpoch,
-        playBlocked: autoplayBlocked
+        playBlocked: autoplayBlocked,
+        buffering
       });
       return;
     }
@@ -951,6 +979,7 @@ import type {
         ...previous,
         playbackState: "paused",
         playBlocked: autoplayBlocked,
+        buffering: false,
         position: previous.position ? {
           ...previous.position,
           playbackRate: 0,
@@ -2042,6 +2071,14 @@ import type {
       registerElement(target);
 
       const hasAudio = !target.muted && target.volume > 0;
+      if (e.type === "waiting" && !target.paused) {
+        waitingForData.add(target);
+      } else if (e.type === "playing" || e.type === "canplay" ||
+                 e.type === "canplaythrough" || e.type === "pause" ||
+                 e.type === "ended" || e.type === "emptied" ||
+                 (e.type === "seeked" && target.readyState >= 3)) {
+        waitingForData.delete(target);
+      }
       if (e.type === "playing") {
         pendingColdPlayUntil = 0;
         if (hasAudio || hadTrustedGesture) {

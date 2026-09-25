@@ -13,6 +13,7 @@
     const MEDIA_EVENTS = [
       "play",
       "playing",
+      "seeking",
       "pause",
       "ended",
       "seeked",
@@ -35,6 +36,7 @@
     const trackedAudioContexts = /* @__PURE__ */ new Set();
     const suspendedByUs = /* @__PURE__ */ new WeakSet();
     const elementsPlayedWithAudio = /* @__PURE__ */ new WeakSet();
+    const waitingForData = /* @__PURE__ */ new WeakSet();
     const pausedByUs = /* @__PURE__ */ new Set();
     let lastPausedElement = null;
     let lastPausedTime = 0;
@@ -43,6 +45,7 @@
     let activeAudioContext = null;
     let currentFrameState = null;
     let evalTimer = null;
+    let bufferingPollTimer = null;
     let lastKnownHref = typeof window !== "undefined" && window.location ? window.location.href : "";
     let pendingColdPlayUntil = 0;
     let ytPlayGeneration = 0;
@@ -395,6 +398,17 @@
     }
     function postState(state) {
       currentFrameState = state;
+      if (state?.buffering) {
+        if (bufferingPollTimer === null) {
+          bufferingPollTimer = window.setTimeout(() => {
+            bufferingPollTimer = null;
+            scheduleEvaluation();
+          }, 300);
+        }
+      } else if (bufferingPollTimer !== null) {
+        clearTimeout(bufferingPollTimer);
+        bufferingPollTimer = null;
+      }
       const msg = {
         __mcx: "up",
         state
@@ -428,6 +442,17 @@
         (el) => !el.muted && el.volume > 0
       );
       const ytVideoId = isYouTube ? getYouTubeVideoId() : null;
+      const ytMedia = audiblePlaying[0] || playingElements[0] || activePrimaryElement || elements[0];
+      let ytPlayerBuffering = false;
+      if (isYouTube) {
+        try {
+          ytPlayerBuffering = getYtPlayer()?.getPlayerState?.() === 3;
+        } catch (_) {
+        }
+      }
+      const buffering = Boolean(
+        isYouTube && ytVideoId && !autoplayBlocked && (hasConfirmedPlayback || hadTrustedGesture) && (ytPlayerBuffering || ytMedia && !ytMedia.ended && (ytMedia.seeking || waitingForData.has(ytMedia)))
+      );
       if (isYouTube && !ytVideoId && audiblePlaying.length === 0) {
         resetSessionState();
         postState(null);
@@ -613,7 +638,8 @@
           seekable: isSeekable,
           volume: getPrimaryVolumeState(),
           lastPlayedAt: lastPlayedAtEpoch,
-          playBlocked: autoplayBlocked
+          playBlocked: autoplayBlocked,
+          buffering
         });
         return;
       }
@@ -653,7 +679,8 @@
           seekable,
           volume: getPrimaryVolumeState(),
           lastPlayedAt: lastPlayedAtEpoch,
-          playBlocked: false
+          playBlocked: false,
+          buffering
         });
         return;
       }
@@ -688,7 +715,8 @@
           seekable,
           volume: getPrimaryVolumeState(),
           lastPlayedAt: lastPlayedAtEpoch,
-          playBlocked: autoplayBlocked
+          playBlocked: autoplayBlocked,
+          buffering
         });
         return;
       }
@@ -730,6 +758,7 @@
           ...previous,
           playbackState: "paused",
           playBlocked: autoplayBlocked,
+          buffering: false,
           position: previous.position ? {
             ...previous.position,
             playbackRate: 0,
@@ -1710,6 +1739,11 @@
         if (isInlinePreviewElement(target)) return;
         registerElement(target);
         const hasAudio = !target.muted && target.volume > 0;
+        if (e.type === "waiting" && !target.paused) {
+          waitingForData.add(target);
+        } else if (e.type === "playing" || e.type === "canplay" || e.type === "canplaythrough" || e.type === "pause" || e.type === "ended" || e.type === "emptied" || e.type === "seeked" && target.readyState >= 3) {
+          waitingForData.delete(target);
+        }
         if (e.type === "playing") {
           pendingColdPlayUntil = 0;
           if (hasAudio || hadTrustedGesture) {

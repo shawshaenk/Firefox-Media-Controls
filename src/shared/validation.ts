@@ -130,6 +130,7 @@ export function sanitizeFrameState(state: any): FrameState | null {
       ? Math.min(Date.now(), Math.max(0, state.lastPlayedAt))
       : Date.now();
   const playBlocked = state.playBlocked === true;
+  const buffering = state.buffering === true;
 
   return {
     source,
@@ -141,7 +142,8 @@ export function sanitizeFrameState(state: any): FrameState | null {
     seekable,
     volume: sanitizeVolume(state.volume),
     lastPlayedAt,
-    playBlocked
+    playBlocked,
+    buffering
   };
 }
 
@@ -164,4 +166,3 @@ export function sanitizeCommand(cmd: any): Command | null {
   }
   return sanitized;
 }
-

@@ -1234,6 +1234,8 @@ function renderChapters(card: CardDom, videoId: string, chapters: YouTubeChapter
 function updatePlayButton(card: CardDom) {
   const session = card.session;
   if (session.degraded) {
+    card.playBtn.classList.remove("is-buffering");
+    card.playBtn.removeAttribute("aria-busy");
     setIcon(card.playBtn, session.muted ? "volume_off" : "volume_up");
     card.playBtn.setAttribute(
       "aria-label",
@@ -1244,11 +1246,19 @@ function updatePlayButton(card: CardDom) {
     return;
   }
   const blocked = session.state?.playBlocked === true;
+  const buffering = session.state?.buffering === true;
   const isPlaying = card.pendingPlayback
     ? card.pendingPlayback.state === "playing"
     : isSessionPlaying(session);
   setIcon(card.playBtn, isPlaying ? "pause" : "play_arrow");
-  if (blocked && !isPlaying) {
+  card.playBtn.classList.toggle("is-buffering", buffering);
+  if (buffering) {
+    card.playBtn.disabled = true;
+    card.playBtn.setAttribute("aria-label", "Video buffering");
+    card.playBtn.setAttribute("aria-busy", "true");
+    card.playBtn.title = "Video is buffering";
+  } else if (blocked && !isPlaying) {
+    card.playBtn.removeAttribute("aria-busy");
     // The page has not played yet and Firefox forbids script initiated play.
     card.playBtn.disabled = true;
     card.playBtn.setAttribute("aria-label", "Play blocked by autoplay");
@@ -1257,6 +1267,7 @@ function updatePlayButton(card: CardDom) {
       "Autoplay is blocked for this video. Open the tab and press play once, then this button will work."
     );
   } else {
+    card.playBtn.removeAttribute("aria-busy");
     card.playBtn.disabled = false;
     card.playBtn.setAttribute("aria-label", isPlaying ? "Pause" : "Play");
     card.playBtn.removeAttribute("title");
@@ -1566,7 +1577,7 @@ function startInterpolationLoop() {
       }
 
       let currentPos = posState.position;
-      if (card.session.state?.playbackState === "playing") {
+      if (card.session.state?.playbackState === "playing" && !card.session.state.buffering) {
         const elapsedSec = (now - posState.updatedAt) / 1000;
         currentPos += elapsedSec * (posState.playbackRate || 1);
       }
