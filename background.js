@@ -297,63 +297,78 @@
         return true;
       }).sort((a, b) => a.startTime - b.startTime).slice(0, 200);
     };
-    const fromData = (data) => {
-      if (data?.currentVideoEndpoint?.watchEndpoint?.videoId !== videoId) return [];
+    const unionRows = (lists) => {
+      const byTime = /* @__PURE__ */ new Map();
+      for (const list of lists) {
+        for (const row of list) {
+          const key = Math.round(row.startTime * 1e3);
+          const prev = byTime.get(key);
+          if (prev === void 0 || row.title.length > prev.length) {
+            byTime.set(key, row.title);
+          }
+        }
+      }
+      return normalize(Array.from(byTime, ([startMs, title]) => ({
+        title,
+        startTime: startMs / 1e3
+      })));
+    };
+    const chaptersFromMarkers = (data) => {
+      const out = [];
       const markers = data?.playerOverlays?.playerOverlayRenderer?.decoratedPlayerBarRenderer?.decoratedPlayerBarRenderer?.playerBar?.multiMarkersPlayerBarRenderer?.markersMap;
       if (Array.isArray(markers)) {
         for (const marker of markers) {
           const chapters = marker?.value?.chapters;
           if (Array.isArray(chapters) && chapters.length > 0) {
-            const rows = normalize(chapters.map((chapter) => ({
+            out.push(chapters.map((chapter) => ({
               title: chapter?.chapterRenderer?.title,
               startTime: Number(chapter?.chapterRenderer?.timeRangeStartMillis) / 1e3
             })));
-            if (rows.length > 0) return rows;
           }
         }
       }
-      const panels = data?.engagementPanels;
-      if (Array.isArray(panels)) {
-        for (const panel of panels) {
-          const contents = panel?.engagementPanelSectionListRenderer?.content?.macroMarkersListRenderer?.contents;
-          if (!Array.isArray(contents)) continue;
-          const rows = normalize(contents.map((item) => ({
-            title: item?.macroMarkersListItemRenderer?.title,
-            startTime: item?.macroMarkersListItemRenderer?.onTap?.watchEndpoint?.startTimeSeconds
-          })));
-          if (rows.length > 0) return rows;
-        }
+      const legacy = data?.playerOverlays?.playerOverlayRenderer?.decoratedPlayerBarRenderer?.decoratedPlayerBarRenderer?.playerBar?.chapteredPlayerBarRenderer?.chapters;
+      if (Array.isArray(legacy) && legacy.length > 0) {
+        out.push(legacy.map((chapter) => ({
+          title: chapter?.chapterRenderer?.title,
+          startTime: Number(chapter?.chapterRenderer?.timeRangeStartMillis) / 1e3
+        })));
       }
-      return [];
+      return out;
     };
-    const current = fromData(window.ytInitialData);
-    if (current.length > 0) return { videoId, chapters: current, status: "available" };
-    const domItems = document.querySelectorAll("ytd-macro-markers-list-item-renderer");
-    if (domItems.length > 0) {
-      const domRows = normalize(Array.from(domItems, (item) => {
-        const data = item.data?.macroMarkersListItemRenderer || item.data;
-        const endpoint = data?.onTap?.watchEndpoint;
-        return {
-          title: endpoint?.videoId === videoId ? data?.title : "",
-          startTime: endpoint?.startTimeSeconds
-        };
-      }));
-      if (domRows.length > 0) return { videoId, chapters: domRows, status: "available" };
-    }
-    const controller = new AbortController();
-    const timeout = window.setTimeout(() => controller.abort(), 7e3);
-    try {
-      const response = await fetch(url.href, {
-        credentials: "include",
-        signal: controller.signal
-      });
-      if (!response.ok) return { videoId, chapters: [], status: "error" };
-      const html = await response.text();
+    const panelsFromData = (data) => {
+      const lists = [];
+      let truncated2 = false;
+      const panels = data?.engagementPanels;
+      if (!Array.isArray(panels)) return { lists, truncated: truncated2 };
+      for (const panel of panels) {
+        const contents = panel?.engagementPanelSectionListRenderer?.content?.macroMarkersListRenderer?.contents;
+        if (!Array.isArray(contents)) continue;
+        if (contents.some((item) => item && typeof item === "object" && "continuationItemRenderer" in item)) {
+          truncated2 = true;
+        }
+        const rows = contents.map((item) => ({
+          title: item?.macroMarkersListItemRenderer?.title,
+          startTime: item?.macroMarkersListItemRenderer?.onTap?.watchEndpoint?.startTimeSeconds
+        }));
+        if (rows.length > 0) lists.push(rows);
+      }
+      return { lists, truncated: truncated2 };
+    };
+    const candidatesFromData = (data) => {
+      if (data?.currentVideoEndpoint?.watchEndpoint?.videoId !== videoId) {
+        return { lists: [], truncated: false };
+      }
+      const lists = [...chaptersFromMarkers(data)];
+      const panels = panelsFromData(data);
+      return { lists: [...lists, ...panels.lists], truncated: panels.truncated };
+    };
+    const parseFetchedDocument = (html) => {
       const marker = "var ytInitialData = ";
       const index = html.indexOf(marker);
-      if (index < 0) return { videoId, chapters: [], status: "error" };
+      if (index < 0) return { lists: [], truncated: false, videoMatch: false };
       const start = html.indexOf("{", index + marker.length);
-      if (start < 0) return { videoId, chapters: [], status: "error" };
+      if (start < 0) return { lists: [], truncated: false, videoMatch: false };
       let depth = 0;
       let quoted = false;
       let escaped = false;
@@ -372,27 +387,141 @@
           try {
             data = JSON.parse(html.slice(start, i + 1));
           } catch (_) {
-            return { videoId, chapters: [], status: "error" };
+            return { lists: [], truncated: false, videoMatch: false };
           }
           if (data?.currentVideoEndpoint?.watchEndpoint?.videoId !== videoId) {
-            return { videoId, chapters: [], status: "error" };
+            return { lists: [], truncated: false, videoMatch: false };
           }
-          const rows = fromData(data);
-          return rows.length > 0 ? { videoId, chapters: rows, status: "available" } : { videoId, chapters: [], status: "none" };
+          const found = candidatesFromData(data);
+          return { lists: found.lists, truncated: found.truncated, videoMatch: true };
         }
       }
-      return { videoId, chapters: [], status: "error" };
+      return { lists: [], truncated: false, videoMatch: false };
+    };
+    const rawLists = [];
+    let truncated = false;
+    let hasInPage = false;
+    try {
+      const inPage = candidatesFromData(window.ytInitialData);
+      if (inPage.lists.length > 0) {
+        hasInPage = true;
+        rawLists.push(...inPage.lists);
+        truncated = truncated || inPage.truncated;
+      }
     } catch (_) {
-      return { videoId, chapters: [], status: "error" };
-    } finally {
-      window.clearTimeout(timeout);
     }
+    try {
+      const domItems = document.querySelectorAll("ytd-macro-markers-list-item-renderer");
+      if (domItems.length > 0) {
+        const domRows = [];
+        domItems.forEach((item) => {
+          const data = item.data?.macroMarkersListItemRenderer || item.data;
+          const endpoint = data?.onTap?.watchEndpoint;
+          domRows.push({
+            title: endpoint?.videoId === videoId ? data?.title : "",
+            startTime: endpoint?.startTimeSeconds
+          });
+        });
+        rawLists.push(domRows);
+      }
+    } catch (_) {
+    }
+    const needFetch = !hasInPage || truncated;
+    let fetchedChecked = false;
+    if (needFetch) {
+      const controller = new AbortController();
+      const timeout = window.setTimeout(() => controller.abort(), 7e3);
+      try {
+        const response = await fetch(url.href, {
+          credentials: "include",
+          signal: controller.signal
+        });
+        if (response.ok) {
+          const html = await response.text();
+          const parsed = parseFetchedDocument(html);
+          if (parsed.videoMatch) {
+            fetchedChecked = true;
+            rawLists.push(...parsed.lists);
+            truncated = truncated || parsed.truncated;
+          }
+        }
+      } catch (_) {
+      } finally {
+        window.clearTimeout(timeout);
+      }
+    }
+    const merged = unionRows(rawLists.map((rows) => normalize(rows)));
+    if (merged.length > 0) {
+      return { videoId, chapters: merged, status: "available", truncated };
+    }
+    if (fetchedChecked) {
+      return { videoId, chapters: [], status: "none", truncated: false };
+    }
+    return { videoId, chapters: [], status: "error", truncated: false };
   }
   var chapterCache = /* @__PURE__ */ new Map();
   var chapterInflight = /* @__PURE__ */ new Map();
   var chapterAttempts = /* @__PURE__ */ new Map();
   var chapterRetryDelays = [3e3, 1e4, 3e4];
   var tabChapterVideo = /* @__PURE__ */ new Map();
+  function mergeChapterLists(existing, incoming) {
+    const byTime = /* @__PURE__ */ new Map();
+    for (const list of [existing, incoming]) {
+      for (const chapter of list) {
+        if (!chapter || typeof chapter.title !== "string" || typeof chapter.startTime !== "number") continue;
+        const key = Math.round(chapter.startTime * 1e3);
+        const prev = byTime.get(key);
+        if (prev === void 0 || chapter.title.length > prev.length) {
+          byTime.set(key, chapter.title);
+        }
+      }
+    }
+    return validateChapters(Array.from(byTime, ([startMs, title]) => ({
+      title,
+      startTime: startMs / 1e3
+    })).sort((a, b) => a.startTime - b.startTime));
+  }
+  function scheduleChapterFollowup(tabId, videoId) {
+    const attempt = chapterAttempts.get(videoId) || 0;
+    if (attempt >= chapterRetryDelays.length || !chapterVideoStillWanted(videoId)) {
+      if (attempt >= chapterRetryDelays.length) chapterAttempts.delete(videoId);
+      return;
+    }
+    chapterAttempts.set(videoId, attempt + 1);
+    const retryTab = tabId;
+    const retryVideo = videoId;
+    setTimeout(() => {
+      chapterInflight.delete(retryVideo);
+      const cached = chapterCache.get(retryVideo);
+      if (!cached && chapterVideoStillWanted(retryVideo)) {
+        void ensureYouTubeChapters(retryTab, retryVideo);
+      } else if (cached?.truncated && chapterVideoStillWanted(retryVideo)) {
+        void refreshYouTubeChapters(retryTab, retryVideo);
+      } else {
+        chapterAttempts.delete(retryVideo);
+      }
+    }, chapterRetryDelays[attempt]);
+  }
+  function notifyChapterUpdate(videoId) {
+    const cached = chapterCache.get(videoId);
+    if (!cached || connectedPopupPorts.size === 0) return;
+    for (const [tabId, info] of tabsInfo.entries()) {
+      if (youtubeWatchVideoId(info.url) !== videoId) continue;
+      const msg = {
+        type: "chapters",
+        tabId,
+        videoId,
+        chapters: cached.status === "available" ? [...cached.chapters] : [],
+        status: cached.status
+      };
+      for (const port of connectedPopupPorts) {
+        try {
+          port.postMessage(msg);
+        } catch (_) {
+        }
+      }
+    }
+  }
   function validateChapters(list) {
     if (!Array.isArray(list)) return [];
     return list.filter(
@@ -437,44 +566,53 @@
       if (page?.videoId !== videoId || page.status !== "available" && page.status !== "none") {
         throw new Error("chapter lookup failed");
       }
+      const truncated = page.truncated === true;
       if (page.status === "available") {
         const chapters = validateChapters(page.chapters);
         if (chapters.length === 0) throw new Error("chapter lookup failed");
-        if (chapterCache.size >= 100) {
+        const previous = chapterCache.get(videoId);
+        const merged = previous?.status === "available" ? mergeChapterLists(previous.chapters, chapters) : chapters;
+        if (merged.length === 0) throw new Error("chapter lookup failed");
+        const grew = !previous || previous.status !== "available" || merged.length > previous.chapters.length;
+        if (!chapterCache.has(videoId) && chapterCache.size >= 100) {
           const oldest = chapterCache.keys().next();
           if (!oldest.done) chapterCache.delete(oldest.value);
         }
-        chapterCache.set(videoId, { status: "available", chapters });
+        chapterCache.set(videoId, { status: "available", chapters: merged, truncated });
+        if (truncated) {
+          scheduleChapterFollowup(tabId, videoId);
+        } else {
+          chapterAttempts.delete(videoId);
+        }
+        broadcastSessions();
+        if (grew) notifyChapterUpdate(videoId);
       } else {
-        if (chapterCache.size >= 100) {
+        if (!chapterCache.has(videoId) && chapterCache.size >= 100) {
           const oldest = chapterCache.keys().next();
           if (!oldest.done) chapterCache.delete(oldest.value);
         }
-        chapterCache.set(videoId, { status: "none", chapters: [] });
-      }
-      chapterAttempts.delete(videoId);
-      broadcastSessions();
-    } catch (err) {
-      const attempt = chapterAttempts.get(videoId) || 0;
-      if (attempt < chapterRetryDelays.length && chapterVideoStillWanted(videoId)) {
-        chapterAttempts.set(videoId, attempt + 1);
-        const retryTab = tabId;
-        const retryVideo = videoId;
-        setTimeout(() => {
-          chapterInflight.delete(retryVideo);
-          if (!chapterCache.has(retryVideo) && chapterVideoStillWanted(retryVideo)) {
-            void ensureYouTubeChapters(retryTab, retryVideo);
-          } else {
-            chapterAttempts.delete(retryVideo);
-          }
-        }, chapterRetryDelays[attempt]);
-      } else {
+        chapterCache.set(videoId, { status: "none", chapters: [], truncated: false });
         chapterAttempts.delete(videoId);
+        broadcastSessions();
       }
+    } catch (err) {
+      scheduleChapterFollowup(tabId, videoId);
     }
   }
   function ensureYouTubeChapters(tabId, videoId) {
-    if (!videoId || chapterCache.has(videoId)) return null;
+    if (!videoId) return null;
+    const cached = chapterCache.get(videoId);
+    if (cached && !cached.truncated) return null;
+    const running = chapterInflight.get(videoId);
+    if (running) return running;
+    const task = lookupYouTubeChapters(tabId, videoId).finally(() => {
+      if (chapterInflight.get(videoId) === task) chapterInflight.delete(videoId);
+    });
+    chapterInflight.set(videoId, task);
+    return task;
+  }
+  function refreshYouTubeChapters(tabId, videoId) {
+    if (!videoId) return null;
     const running = chapterInflight.get(videoId);
     if (running) return running;
     const task = lookupYouTubeChapters(tabId, videoId).finally(() => {
@@ -1319,18 +1457,15 @@
             const tab = await browser.tabs.get(msg.tabId);
             if (isYouTubeVideoWatchUrl(tab.url)) {
               videoId = youtubeWatchVideoId(tab.url) || "";
-              const cached = chapterCache.get(videoId);
-              if (cached) {
-                status = cached.status;
-                chapters = cached.status === "available" ? [...cached.chapters] : [];
-              } else {
+              const known = chapterCache.get(videoId);
+              if (!known || known.status !== "none") {
                 chapterAttempts.delete(videoId);
-                await ensureYouTubeChapters(msg.tabId, videoId);
-                const fresh = chapterCache.get(videoId);
-                if (fresh) {
-                  status = fresh.status;
-                  chapters = fresh.status === "available" ? [...fresh.chapters] : [];
-                }
+                await refreshYouTubeChapters(msg.tabId, videoId);
+              }
+              const fresh = chapterCache.get(videoId);
+              if (fresh) {
+                status = fresh.status;
+                chapters = fresh.status === "available" ? [...fresh.chapters] : [];
               }
             }
           } catch (err) {

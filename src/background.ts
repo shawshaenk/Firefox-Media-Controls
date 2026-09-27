@@ -170,10 +170,18 @@ function advanceYouTubeVideoInPage(): boolean {
 // status distinguishes a confirmed chapter-free video ("none") from a failed
 // lookup ("error"): fetch errors, timeouts, and stale page data are never
 // treated as proof that the video has no chapters.
+//
+// Every source (player-bar markers, engagement panels, DOM list items, fetched
+// document) can be partial on its own: panels can be paginated behind a
+// continuation, the DOM list is virtualized and binds its `data` async, and
+// the in-page copy can predate lazy YouTube updates. Collect every candidate
+// and merge by start time instead of returning the first non-empty source, so
+// an early partial read (missing 0:00 or the tail) does not stick.
 async function readYouTubeChaptersInPage(): Promise<{
   videoId: string;
   chapters: { title: string; startTime: number }[];
   status: "available" | "none" | "error";
+  truncated?: boolean;
 }> {
   const url = new URL(window.location.href);
   const videoId = url.searchParams.get("v") || "";
@@ -201,8 +209,27 @@ async function readYouTubeChaptersInPage(): Promise<{
       return true;
     }).sort((a, b) => a.startTime - b.startTime).slice(0, 200);
   };
-  const fromData = (data: any) => {
-    if (data?.currentVideoEndpoint?.watchEndpoint?.videoId !== videoId) return [];
+  // Union several normalized lists by start time (millisecond key so the
+  // millis-based player bar and seconds-based panels coincide). On conflict
+  // keep the longest title, then re-normalize for sort/dedup/slice.
+  const unionRows = (lists: { title: string; startTime: number }[][]) => {
+    const byTime = new Map<number, string>();
+    for (const list of lists) {
+      for (const row of list) {
+        const key = Math.round(row.startTime * 1000);
+        const prev = byTime.get(key);
+        if (prev === undefined || row.title.length > prev.length) {
+          byTime.set(key, row.title);
+        }
+      }
+    }
+    return normalize(Array.from(byTime, ([startMs, title]) => ({
+      title,
+      startTime: startMs / 1000
+    })));
+  };
+  const chaptersFromMarkers = (data: any): { title: unknown; startTime: unknown }[][] => {
+    const out: { title: unknown; startTime: unknown }[][] = [];
     const markers = data?.playerOverlays?.playerOverlayRenderer
       ?.decoratedPlayerBarRenderer?.decoratedPlayerBarRenderer?.playerBar
       ?.multiMarkersPlayerBarRenderer?.markersMap;
@@ -210,60 +237,59 @@ async function readYouTubeChaptersInPage(): Promise<{
       for (const marker of markers) {
         const chapters = marker?.value?.chapters;
         if (Array.isArray(chapters) && chapters.length > 0) {
-          const rows = normalize(chapters.map((chapter: any) => ({
+          out.push(chapters.map((chapter: any) => ({
             title: chapter?.chapterRenderer?.title,
             startTime: Number(chapter?.chapterRenderer?.timeRangeStartMillis) / 1000
           })));
-          if (rows.length > 0) return rows;
         }
       }
     }
-    const panels = data?.engagementPanels;
-    if (Array.isArray(panels)) {
-      for (const panel of panels) {
-        const contents = panel?.engagementPanelSectionListRenderer?.content
-          ?.macroMarkersListRenderer?.contents;
-        if (!Array.isArray(contents)) continue;
-        const rows = normalize(contents.map((item: any) => ({
-          title: item?.macroMarkersListItemRenderer?.title,
-          startTime: item?.macroMarkersListItemRenderer?.onTap?.watchEndpoint?.startTimeSeconds
-        })));
-        if (rows.length > 0) return rows;
-      }
+    // Legacy player layout kept for older responses.
+    const legacy = data?.playerOverlays?.playerOverlayRenderer
+      ?.decoratedPlayerBarRenderer?.decoratedPlayerBarRenderer?.playerBar
+      ?.chapteredPlayerBarRenderer?.chapters;
+    if (Array.isArray(legacy) && legacy.length > 0) {
+      out.push(legacy.map((chapter: any) => ({
+        title: chapter?.chapterRenderer?.title,
+        startTime: Number(chapter?.chapterRenderer?.timeRangeStartMillis) / 1000
+      })));
     }
-    return [];
+    return out;
   };
-
-  const current = fromData((window as any).ytInitialData);
-  if (current.length > 0) return { videoId, chapters: current, status: "available" as const };
-
-  const domItems = document.querySelectorAll("ytd-macro-markers-list-item-renderer");
-  if (domItems.length > 0) {
-    const domRows = normalize(Array.from(domItems, (item: any) => {
-      const data = item.data?.macroMarkersListItemRenderer || item.data;
-      const endpoint = data?.onTap?.watchEndpoint;
-      return {
-        title: endpoint?.videoId === videoId ? data?.title : "",
-        startTime: endpoint?.startTimeSeconds
-      };
-    }));
-    if (domRows.length > 0) return { videoId, chapters: domRows, status: "available" as const };
-  }
-
-  const controller = new AbortController();
-  const timeout = window.setTimeout(() => controller.abort(), 7000);
-  try {
-    const response = await fetch(url.href, {
-      credentials: "include",
-      signal: controller.signal
-    });
-    if (!response.ok) return { videoId, chapters: [], status: "error" as const };
-    const html = await response.text();
+  const panelsFromData = (data: any): { lists: { title: unknown; startTime: unknown }[][]; truncated: boolean } => {
+    const lists: { title: unknown; startTime: unknown }[][] = [];
+    let truncated = false;
+    const panels = data?.engagementPanels;
+    if (!Array.isArray(panels)) return { lists, truncated };
+    for (const panel of panels) {
+      const contents = panel?.engagementPanelSectionListRenderer?.content
+        ?.macroMarkersListRenderer?.contents;
+      if (!Array.isArray(contents)) continue;
+      if (contents.some((item: any) => item && typeof item === "object" && "continuationItemRenderer" in item)) {
+        truncated = true;
+      }
+      const rows = contents.map((item: any) => ({
+        title: item?.macroMarkersListItemRenderer?.title,
+        startTime: item?.macroMarkersListItemRenderer?.onTap?.watchEndpoint?.startTimeSeconds
+      }));
+      if (rows.length > 0) lists.push(rows);
+    }
+    return { lists, truncated };
+  };
+  const candidatesFromData = (data: any): { lists: { title: unknown; startTime: unknown }[][]; truncated: boolean } => {
+    if (data?.currentVideoEndpoint?.watchEndpoint?.videoId !== videoId) {
+      return { lists: [], truncated: false };
+    }
+    const lists = [...chaptersFromMarkers(data)];
+    const panels = panelsFromData(data);
+    return { lists: [...lists, ...panels.lists], truncated: panels.truncated };
+  };
+  const parseFetchedDocument = (html: string): { lists: { title: unknown; startTime: unknown }[][]; truncated: boolean; videoMatch: boolean } => {
     const marker = "var ytInitialData = ";
     const index = html.indexOf(marker);
-    if (index < 0) return { videoId, chapters: [], status: "error" as const };
+    if (index < 0) return { lists: [], truncated: false, videoMatch: false };
     const start = html.indexOf("{", index + marker.length);
-    if (start < 0) return { videoId, chapters: [], status: "error" as const };
+    if (start < 0) return { lists: [], truncated: false, videoMatch: false };
     let depth = 0;
     let quoted = false;
     let escaped = false;
@@ -282,38 +308,170 @@ async function readYouTubeChaptersInPage(): Promise<{
         try {
           data = JSON.parse(html.slice(start, i + 1));
         } catch (_) {
-          return { videoId, chapters: [], status: "error" as const };
+          return { lists: [], truncated: false, videoMatch: false };
         }
         // The fetched document must describe this video; anything else is
         // stale data, not proof the video has no chapters.
         if (data?.currentVideoEndpoint?.watchEndpoint?.videoId !== videoId) {
-          return { videoId, chapters: [], status: "error" as const };
+          return { lists: [], truncated: false, videoMatch: false };
         }
-        const rows = fromData(data);
-        return rows.length > 0
-          ? { videoId, chapters: rows, status: "available" as const }
-          : { videoId, chapters: [], status: "none" as const };
+        const found = candidatesFromData(data);
+        return { lists: found.lists, truncated: found.truncated, videoMatch: true };
       }
     }
-    return { videoId, chapters: [], status: "error" as const };
-  } catch (_) {
-    // The current page or its DOM may still provide chapters next time.
-    return { videoId, chapters: [], status: "error" as const };
-  } finally {
-    window.clearTimeout(timeout);
+    return { lists: [], truncated: false, videoMatch: false };
+  };
+
+  const rawLists: { title: unknown; startTime: unknown }[][] = [];
+  let truncated = false;
+  let hasInPage = false;
+  try {
+    const inPage = candidatesFromData((window as any).ytInitialData);
+    if (inPage.lists.length > 0) {
+      hasInPage = true;
+      rawLists.push(...inPage.lists);
+      truncated = truncated || inPage.truncated;
+    }
+  } catch (_) {}
+
+  try {
+    const domItems = document.querySelectorAll("ytd-macro-markers-list-item-renderer");
+    if (domItems.length > 0) {
+      const domRows: { title: unknown; startTime: unknown }[] = [];
+      domItems.forEach((item: any) => {
+        const data = item.data?.macroMarkersListItemRenderer || item.data;
+        const endpoint = data?.onTap?.watchEndpoint;
+        domRows.push({
+          title: endpoint?.videoId === videoId ? data?.title : "",
+          startTime: endpoint?.startTimeSeconds
+        });
+      });
+      rawLists.push(domRows);
+    }
+  } catch (_) {}
+
+  // The DOM list alone is untrusted: it is virtualized and binds async, so a
+  // DOM-only result is often a partial window (missing 0:00 or the tail).
+  // Always consult the fetched document when there is no in-page data or when
+  // any source signals pagination.
+  const needFetch = !hasInPage || truncated;
+  let fetchedChecked = false;
+  if (needFetch) {
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), 7000);
+    try {
+      const response = await fetch(url.href, {
+        credentials: "include",
+        signal: controller.signal
+      });
+      if (response.ok) {
+        const html = await response.text();
+        const parsed = parseFetchedDocument(html);
+        if (parsed.videoMatch) {
+          fetchedChecked = true;
+          rawLists.push(...parsed.lists);
+          truncated = truncated || parsed.truncated;
+        }
+      }
+    } catch (_) {
+      // The current page or its DOM may still provide chapters next time.
+    } finally {
+      window.clearTimeout(timeout);
+    }
   }
+
+  const merged = unionRows(rawLists.map((rows) => normalize(rows)));
+  if (merged.length > 0) {
+    return { videoId, chapters: merged, status: "available" as const, truncated };
+  }
+  if (fetchedChecked) {
+    return { videoId, chapters: [], status: "none" as const, truncated: false };
+  }
+  return { videoId, chapters: [], status: "error" as const, truncated: false };
 }
 
 // Proactive YouTube chapter detection. As soon as a new watch video ID is
-// seen, its chapters are read once and cached per video ("has chapters" or
+// seen, its chapters are read and cached per video ("has chapters" or
 // "no chapters"); the cached result is attached to the card's session data.
 // A failed lookup is never cached as "no chapters" — it is retried with
-// backoff while some tab still shows that video.
-const chapterCache = new Map<string, { status: "available" | "none"; chapters: YouTubeChapter[] }>();
+// backoff while some tab still shows that video. A truncated (partial)
+// success is kept but followed up on the same backoff so late-arriving
+// chapters merge in instead of sticking partial forever.
+const chapterCache = new Map<string, { status: "available" | "none"; chapters: YouTubeChapter[]; truncated?: boolean }>();
 const chapterInflight = new Map<string, Promise<void>>();
 const chapterAttempts = new Map<string, number>();
 const chapterRetryDelays = [3000, 10000, 30000];
 const tabChapterVideo = new Map<number, string>();
+
+// Union cached chapters with a fresh lookup so a later, more complete read
+// (missing 0:00 or tail filled in) overwrites an early partial result instead
+// of the partial sticking forever. On title conflict keep the longest title.
+function mergeChapterLists(
+  existing: YouTubeChapter[],
+  incoming: YouTubeChapter[]
+): YouTubeChapter[] {
+  const byTime = new Map<number, string>();
+  for (const list of [existing, incoming]) {
+    for (const chapter of list) {
+      if (!chapter || typeof chapter.title !== "string" || typeof chapter.startTime !== "number") continue;
+      const key = Math.round(chapter.startTime * 1000);
+      const prev = byTime.get(key);
+      if (prev === undefined || chapter.title.length > prev.length) {
+        byTime.set(key, chapter.title);
+      }
+    }
+  }
+  return validateChapters(Array.from(byTime, ([startMs, title]) => ({
+    title,
+    startTime: startMs / 1000
+  })).sort((a, b) => a.startTime - b.startTime));
+}
+
+function scheduleChapterFollowup(tabId: number, videoId: string) {
+  const attempt = chapterAttempts.get(videoId) || 0;
+  if (attempt >= chapterRetryDelays.length || !chapterVideoStillWanted(videoId)) {
+    if (attempt >= chapterRetryDelays.length) chapterAttempts.delete(videoId);
+    return;
+  }
+  chapterAttempts.set(videoId, attempt + 1);
+  const retryTab = tabId;
+  const retryVideo = videoId;
+  setTimeout(() => {
+    chapterInflight.delete(retryVideo);
+    const cached = chapterCache.get(retryVideo);
+    // Errors are never cached, so a missing entry always wants a retry. A
+    // cached entry only wants a follow-up while it is still truncated.
+    if (!cached && chapterVideoStillWanted(retryVideo)) {
+      void ensureYouTubeChapters(retryTab, retryVideo);
+    } else if (cached?.truncated && chapterVideoStillWanted(retryVideo)) {
+      void refreshYouTubeChapters(retryTab, retryVideo);
+    } else {
+      chapterAttempts.delete(retryVideo);
+    }
+  }, chapterRetryDelays[attempt]);
+}
+
+// Push a grown chapter list to any open popup showing this video, so a list
+// that completes after the menu was opened heals without reopening it.
+function notifyChapterUpdate(videoId: string) {
+  const cached = chapterCache.get(videoId);
+  if (!cached || connectedPopupPorts.size === 0) return;
+  for (const [tabId, info] of tabsInfo.entries()) {
+    if (youtubeWatchVideoId(info.url) !== videoId) continue;
+    const msg = {
+      type: "chapters",
+      tabId,
+      videoId,
+      chapters: cached.status === "available" ? [...cached.chapters] : [],
+      status: cached.status
+    };
+    for (const port of connectedPopupPorts) {
+      try {
+        port.postMessage(msg);
+      } catch (_) {}
+    }
+  }
+}
 
 function validateChapters(list: unknown): YouTubeChapter[] {
   if (!Array.isArray(list)) return [];
@@ -363,50 +521,69 @@ async function lookupYouTubeChapters(tabId: number, videoId: string): Promise<vo
       world: "MAIN" as any,
       func: readYouTubeChaptersInPage as () => void
     });
-    const page = result[0]?.result as { videoId?: unknown; chapters?: unknown; status?: unknown } | undefined;
+    const page = result[0]?.result as { videoId?: unknown; chapters?: unknown; status?: unknown; truncated?: unknown } | undefined;
     if (page?.videoId !== videoId || (page.status !== "available" && page.status !== "none")) {
       throw new Error("chapter lookup failed");
     }
+    const truncated = page.truncated === true;
     if (page.status === "available") {
       const chapters = validateChapters(page.chapters);
       if (chapters.length === 0) throw new Error("chapter lookup failed");
-      if (chapterCache.size >= 100) {
+      const previous = chapterCache.get(videoId);
+      const merged = previous?.status === "available"
+        ? mergeChapterLists(previous.chapters, chapters)
+        : chapters;
+      if (merged.length === 0) throw new Error("chapter lookup failed");
+      const grew = !previous || previous.status !== "available" ||
+        merged.length > previous.chapters.length;
+      if (!chapterCache.has(videoId) && chapterCache.size >= 100) {
         const oldest = chapterCache.keys().next();
         if (!oldest.done) chapterCache.delete(oldest.value);
       }
-      chapterCache.set(videoId, { status: "available", chapters });
+      chapterCache.set(videoId, { status: "available", chapters: merged, truncated });
+      if (truncated) {
+        // Partial (paginated/virtualized) success: keep the partial list but
+        // schedule follow-ups while YouTube finishes loading the rest.
+        scheduleChapterFollowup(tabId, videoId);
+      } else {
+        chapterAttempts.delete(videoId);
+      }
+      broadcastSessions();
+      if (grew) notifyChapterUpdate(videoId);
     } else {
-      if (chapterCache.size >= 100) {
+      if (!chapterCache.has(videoId) && chapterCache.size >= 100) {
         const oldest = chapterCache.keys().next();
         if (!oldest.done) chapterCache.delete(oldest.value);
       }
-      chapterCache.set(videoId, { status: "none", chapters: [] });
+      chapterCache.set(videoId, { status: "none", chapters: [], truncated: false });
+      chapterAttempts.delete(videoId);
+      broadcastSessions();
     }
-    chapterAttempts.delete(videoId);
-    broadcastSessions();
   } catch (err) {
     // Never classify a failure as "no chapters"; retry while wanted.
-    const attempt = chapterAttempts.get(videoId) || 0;
-    if (attempt < chapterRetryDelays.length && chapterVideoStillWanted(videoId)) {
-      chapterAttempts.set(videoId, attempt + 1);
-      const retryTab = tabId;
-      const retryVideo = videoId;
-      setTimeout(() => {
-        chapterInflight.delete(retryVideo);
-        if (!chapterCache.has(retryVideo) && chapterVideoStillWanted(retryVideo)) {
-          void ensureYouTubeChapters(retryTab, retryVideo);
-        } else {
-          chapterAttempts.delete(retryVideo);
-        }
-      }, chapterRetryDelays[attempt]);
-    } else {
-      chapterAttempts.delete(videoId);
-    }
+    scheduleChapterFollowup(tabId, videoId);
   }
 }
 
 function ensureYouTubeChapters(tabId: number, videoId: string): Promise<void> | null {
-  if (!videoId || chapterCache.has(videoId)) return null;
+  if (!videoId) return null;
+  const cached = chapterCache.get(videoId);
+  // A truncated cached list is still incomplete: allow one refresh flight to
+  // complete it, but do not start duplicate flights.
+  if (cached && !cached.truncated) return null;
+  const running = chapterInflight.get(videoId);
+  if (running) return running;
+  const task = lookupYouTubeChapters(tabId, videoId).finally(() => {
+    if (chapterInflight.get(videoId) === task) chapterInflight.delete(videoId);
+  });
+  chapterInflight.set(videoId, task);
+  return task;
+}
+
+// Explicit user intent (chapter menu opened): always re-read the page and
+// merge, even when a partial list is already cached, so the menu heals.
+function refreshYouTubeChapters(tabId: number, videoId: string): Promise<void> | null {
+  if (!videoId) return null;
   const running = chapterInflight.get(videoId);
   if (running) return running;
   const task = lookupYouTubeChapters(tabId, videoId).finally(() => {
@@ -1390,8 +1567,9 @@ browser.runtime.onConnect.addListener((port) => {
         await persistState();
         broadcastSessions();
       } else if (msg.type === "chapters-request") {
-        // Chapter lists are served from the proactive per-video cache. An
-        // explicit popup request also (re)starts detection when uncached.
+        // Chapter lists are served from the proactive per-video cache, but an
+        // explicit popup request always re-reads and merges: an early partial
+        // read (missing 0:00 or the tail) must heal instead of sticking.
         const currentUrl = tabsInfo.get(msg.tabId)?.url;
         let videoId = youtubeWatchVideoId(currentUrl) || "";
         let chapters: YouTubeChapter[] = [];
@@ -1400,18 +1578,16 @@ browser.runtime.onConnect.addListener((port) => {
           const tab = await browser.tabs.get(msg.tabId);
           if (isYouTubeVideoWatchUrl(tab.url)) {
             videoId = youtubeWatchVideoId(tab.url) || "";
-            const cached = chapterCache.get(videoId);
-            if (cached) {
-              status = cached.status;
-              chapters = cached.status === "available" ? [...cached.chapters] : [];
-            } else {
+            const known = chapterCache.get(videoId);
+            // A confirmed chapter-free video needs no re-read.
+            if (!known || known.status !== "none") {
               chapterAttempts.delete(videoId);
-              await ensureYouTubeChapters(msg.tabId, videoId);
-              const fresh = chapterCache.get(videoId);
-              if (fresh) {
-                status = fresh.status;
-                chapters = fresh.status === "available" ? [...fresh.chapters] : [];
-              }
+              await refreshYouTubeChapters(msg.tabId, videoId);
+            }
+            const fresh = chapterCache.get(videoId);
+            if (fresh) {
+              status = fresh.status;
+              chapters = fresh.status === "available" ? [...fresh.chapters] : [];
             }
           }
         } catch (err) {

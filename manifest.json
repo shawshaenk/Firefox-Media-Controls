@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Chrome Media Controls",
-  "version": "1.0.3",
-  "description": "Global media controls panel for tabs playing audio.",
+  "version": "1.0.4",
+  "description": "Google Chrome-style global media controls for tabs playing audio.",
   "browser_specific_settings": {
     "gecko": {
       "id": "media-controls@example.com",
