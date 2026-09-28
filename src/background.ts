@@ -490,10 +490,16 @@ function chapterVideoStillWanted(videoId: string): boolean {
   return false;
 }
 
-function chapterStateFor(videoId: string | undefined): { videoId: string; status: "available" | "none" } | null {
+function chapterStateFor(videoId: string | undefined): { videoId: string; status: "available" | "none"; chapters: YouTubeChapter[]; truncated?: boolean } | null {
   if (!videoId) return null;
   const cached = chapterCache.get(videoId);
-  return cached ? { videoId, status: cached.status } : null;
+  if (!cached) return null;
+  return {
+    videoId,
+    status: cached.status,
+    chapters: cached.status === "available" ? [...cached.chapters] : [],
+    truncated: cached.truncated
+  };
 }
 
 async function lookupYouTubeChapters(tabId: number, videoId: string): Promise<void> {
@@ -1567,36 +1573,51 @@ browser.runtime.onConnect.addListener((port) => {
         await persistState();
         broadcastSessions();
       } else if (msg.type === "chapters-request") {
-        // Chapter lists are served from the proactive per-video cache, but an
-        // explicit popup request always re-reads and merges: an early partial
-        // read (missing 0:00 or the tail) must heal instead of sticking.
+        // Instant-open contract: the popup already carries the cached list
+        // inside its session (`chapterState.chapters`) and renders it
+        // synchronously on click — never a "Loading…" state. This handler
+        // therefore answers from cache immediately, then re-reads/merges in
+        // the background so an early partial read (missing 0:00 or the tail)
+        // still heals via broadcastSessions + notifyChapterUpdate instead of
+        // sticking. A confirmed chapter-free video needs no re-read.
         const currentUrl = tabsInfo.get(msg.tabId)?.url;
         let videoId = youtubeWatchVideoId(currentUrl) || "";
-        let chapters: YouTubeChapter[] = [];
-        let status: "available" | "none" | "error" = "error";
+        const respond = (tabId: number, id: string) => {
+          const cached = chapterCache.get(id);
+          const status: "available" | "none" | "error" = cached ? cached.status : "error";
+          const chapters = cached && cached.status === "available" ? [...cached.chapters] : [];
+          try {
+            port.postMessage({ type: "chapters", tabId, videoId: id, chapters, status } as BgToPopupMessage);
+          } catch (_) {}
+        };
         try {
           const tab = await browser.tabs.get(msg.tabId);
-          if (isYouTubeVideoWatchUrl(tab.url)) {
+          if (!isYouTubeVideoWatchUrl(tab.url)) {
+            respond(msg.tabId, videoId);
+          } else {
             videoId = youtubeWatchVideoId(tab.url) || "";
             const known = chapterCache.get(videoId);
-            // A confirmed chapter-free video needs no re-read.
-            if (!known || known.status !== "none") {
+            if (known) {
+              // Cached: reply now so the menu is instantaneous, then heal.
+              respond(msg.tabId, videoId);
+              if (known.status !== "none") {
+                chapterAttempts.delete(videoId);
+                void refreshYouTubeChapters(msg.tabId, videoId);
+              }
+            } else {
+              // Cold (popup beat the proactive lookup): do one immediate
+              // read so the menu still resolves, keeping merge/retry logic.
               chapterAttempts.delete(videoId);
               await refreshYouTubeChapters(msg.tabId, videoId);
-            }
-            const fresh = chapterCache.get(videoId);
-            if (fresh) {
-              status = fresh.status;
-              chapters = fresh.status === "available" ? [...fresh.chapters] : [];
+              respond(msg.tabId, videoId);
             }
           }
         } catch (err) {
           console.warn("[MediaControls Background] Could not read YouTube chapters:", err);
-          status = "error";
+          try {
+            port.postMessage({ type: "chapters", tabId: msg.tabId, videoId, chapters: [], status: "error" } as BgToPopupMessage);
+          } catch (_) {}
         }
-        try {
-          port.postMessage({ type: "chapters", tabId: msg.tabId, videoId, chapters, status } as BgToPopupMessage);
-        } catch (_) {}
       } else if (msg.type === "request-sessions") {
         await refreshTabsAndInject();
         port.postMessage({

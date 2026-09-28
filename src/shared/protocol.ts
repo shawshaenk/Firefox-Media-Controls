@@ -78,10 +78,15 @@ export interface YouTubeChapter {
 // Cached YouTube chapter availability for one video, attached to the card's
 // session data. `status` is only ever "available" or "none": a failed lookup
 // is never classified as "no chapters" (it stays absent/unknown and is
-// retried). Absent (null) means the lookup has not finished yet.
+// retried). Absent (null) means the lookup has not finished yet. `chapters`
+// carries the cached list so the popup can render instantly on open without a
+// "Loading…" round-trip; the background keeps refreshing/merging in the
+// background for late-arriving (truncated) chapters.
 export interface ChapterState {
   videoId: string;
   status: "available" | "none";
+  chapters: YouTubeChapter[];
+  truncated?: boolean;
 }
 
 // MAIN -> relay: { __mcx: "up", state: FrameState | null }

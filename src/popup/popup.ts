@@ -524,13 +524,16 @@ function createCardDom(session: Session): CardDom {
     const chapterState = cardDom.session.chapterState;
     if (chapterState && chapterState.videoId === videoId && chapterState.status === "none") return;
     const willOpen = !cardDom.chaptersOpen;
-    setChaptersOpen(cardDom, willOpen);
     if (willOpen) {
+      // Instant open: the chapter list was pre-cached from the session data
+      // in the background, so render it synchronously — never a "Loading…"
+      // state. Still notify the background so a partial list can heal.
       setVolumeOpen(cardDom, false);
-      if (cardDom.chapterVideoId !== videoId) {
-        showChapterMessage(cardDom, "Loading chapters…");
-      }
+      renderCachedChaptersInstantly(cardDom, videoId);
+      setChaptersOpen(cardDom, true);
       port?.postMessage({ type: "chapters-request", tabId: cardDom.session.tabId } as PopupToBgMessage);
+    } else {
+      setChaptersOpen(cardDom, false);
     }
   });
 
@@ -1129,9 +1132,72 @@ function updateChaptersButton(card: CardDom) {
   }
 }
 
+// Renders the already-cached chapter list synchronously so opening the
+// dropdown is instantaneous — no "Loading…" flash. The list comes from the
+// proactive background cache carried in `session.chapterState.chapters`
+// (synced into `card.chapters` on every session update). Falls back to the
+// card's own cache, and only as a last resort shows the no-chapters message.
+function renderCachedChaptersInstantly(card: CardDom, videoId: string) {
+  const state = card.session.chapterState;
+  if (state && state.videoId === videoId && state.status === "available") {
+    renderChapters(card, videoId, [...state.chapters]);
+    return;
+  }
+  if (state && state.videoId === videoId && state.status === "none") {
+    renderChapters(card, videoId, []);
+    return;
+  }
+  if (card.chapterVideoId === videoId && card.chapters.length > 0) {
+    renderChapters(card, videoId, [...card.chapters]);
+    return;
+  }
+  if (card.chapterVideoId === videoId && card.chapterList.childElementCount > 0) {
+    return;
+  }
+  renderChapters(card, videoId, []);
+}
+
+// Pre-caches the chapter list from the session broadcast while the dropdown
+// is still closed, so the later click renders instantly. When the dropdown
+// is already open, re-renders to heal a partial list that grew in the
+// background (the late-chapters fix) without requiring a reopen.
+function syncChaptersFromSession(card: CardDom) {
+  const videoId = card.session.youtubeVideoId ?? null;
+  const state = card.session.chapterState;
+  if (!videoId || card.session.degraded) return;
+  if (!state || state.videoId !== videoId) return;
+  if (state.status === "available") {
+    const incoming = state.chapters || [];
+    const sameVideo = card.chapterVideoId === videoId;
+    const sameLength = sameVideo && card.chapters.length === incoming.length;
+    const sameContent = sameLength && card.chapters.every(
+      (chapter, index) => chapter.startTime === incoming[index]?.startTime &&
+        chapter.title === incoming[index]?.title
+    );
+    if (!sameContent) {
+      card.chapterVideoId = videoId;
+      card.chapters = [...incoming];
+      card.activeChapterIndex = -1;
+      if (card.chaptersOpen) {
+        renderChapters(card, videoId, [...incoming]);
+      }
+    }
+  } else if (state.status === "none") {
+    if (card.chapterVideoId !== videoId || card.chapters.length !== 0) {
+      card.chapterVideoId = videoId;
+      card.chapters = [];
+      card.activeChapterIndex = -1;
+      if (card.chaptersOpen) {
+        renderChapters(card, videoId, []);
+      }
+    }
+  }
+}
+
 // Stores a chapter list response for the open section. Responses for a video
 // the card no longer shows are ignored so an old response can never affect
-// the new video. Button state itself comes from the session data.
+// the new video. Button state itself comes from the session data. A failed
+// background refresh never wipes an already-visible instant list.
 function applyChaptersResult(
   card: CardDom,
   msg: { tabId: number; videoId: string; chapters: YouTubeChapter[]; status: "available" | "none" | "error" }
@@ -1142,11 +1208,19 @@ function applyChaptersResult(
   if (msg.status === "available") {
     renderChapters(card, msg.videoId, msg.chapters);
   } else if (msg.status === "none") {
+    card.chapterVideoId = msg.videoId;
+    card.chapters = [];
+    card.activeChapterIndex = -1;
     if (card.chaptersOpen) {
       renderChapters(card, msg.videoId, []);
     }
   } else if (card.chaptersOpen) {
-    showChapterMessage(card, "Could not load chapters");
+    const hasInstantList = card.chapterVideoId === msg.videoId && (
+      card.chapters.length > 0 || card.chapterList.querySelector(".chapter-row") !== null
+    );
+    if (!hasInstantList) {
+      showChapterMessage(card, "Could not load chapters");
+    }
   }
 }
 
@@ -1398,6 +1472,9 @@ function updateCardDom(card: CardDom, session: Session) {
   }
   if (card.chapterBtn.hidden && card.chaptersOpen) setChaptersOpen(card, false);
   updateChaptersButton(card);
+  // Pre-cache the chapter list from the background so opening the dropdown
+  // renders instantly with no loading state.
+  syncChaptersFromSession(card);
   card.volumeSection.id = `volume-${session.tabId}`;
   card.volumeBtn.setAttribute("aria-controls", card.volumeSection.id);
 

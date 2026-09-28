@@ -423,6 +423,14 @@ scrollbar {
   to { transform: rotate(360deg); }
 }
 
+/* Respect the OS animation setting: when animations are off, the buffering
+   indicator stays visible but does not spin. */
+@media (prefers-reduced-motion: reduce) {
+  .play-btn.is-buffering::after {
+    animation: none;
+  }
+}
+
 @media (prefers-color-scheme: dark) {
   .play-btn:hover {
     filter: brightness(1.1);

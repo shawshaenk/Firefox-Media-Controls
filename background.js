@@ -537,7 +537,13 @@
   function chapterStateFor(videoId) {
     if (!videoId) return null;
     const cached = chapterCache.get(videoId);
-    return cached ? { videoId, status: cached.status } : null;
+    if (!cached) return null;
+    return {
+      videoId,
+      status: cached.status,
+      chapters: cached.status === "available" ? [...cached.chapters] : [],
+      truncated: cached.truncated
+    };
   }
   async function lookupYouTubeChapters(tabId, videoId) {
     try {
@@ -1451,30 +1457,40 @@
         } else if (msg.type === "chapters-request") {
           const currentUrl = tabsInfo.get(msg.tabId)?.url;
           let videoId = youtubeWatchVideoId(currentUrl) || "";
-          let chapters = [];
-          let status = "error";
+          const respond = (tabId, id) => {
+            const cached = chapterCache.get(id);
+            const status = cached ? cached.status : "error";
+            const chapters = cached && cached.status === "available" ? [...cached.chapters] : [];
+            try {
+              port.postMessage({ type: "chapters", tabId, videoId: id, chapters, status });
+            } catch (_) {
+            }
+          };
           try {
             const tab = await browser.tabs.get(msg.tabId);
-            if (isYouTubeVideoWatchUrl(tab.url)) {
+            if (!isYouTubeVideoWatchUrl(tab.url)) {
+              respond(msg.tabId, videoId);
+            } else {
               videoId = youtubeWatchVideoId(tab.url) || "";
               const known = chapterCache.get(videoId);
-              if (!known || known.status !== "none") {
+              if (known) {
+                respond(msg.tabId, videoId);
+                if (known.status !== "none") {
+                  chapterAttempts.delete(videoId);
+                  void refreshYouTubeChapters(msg.tabId, videoId);
+                }
+              } else {
                 chapterAttempts.delete(videoId);
                 await refreshYouTubeChapters(msg.tabId, videoId);
-              }
-              const fresh = chapterCache.get(videoId);
-              if (fresh) {
-                status = fresh.status;
-                chapters = fresh.status === "available" ? [...fresh.chapters] : [];
+                respond(msg.tabId, videoId);
               }
             }
           } catch (err) {
             console.warn("[MediaControls Background] Could not read YouTube chapters:", err);
-            status = "error";
-          }
-          try {
-            port.postMessage({ type: "chapters", tabId: msg.tabId, videoId, chapters, status });
-          } catch (_) {
+            try {
+              port.postMessage({ type: "chapters", tabId: msg.tabId, videoId, chapters: [], status: "error" });
+            } catch (_) {
+            }
           }
         } else if (msg.type === "request-sessions") {
           await refreshTabsAndInject();
