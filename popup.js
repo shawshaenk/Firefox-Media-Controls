@@ -106,11 +106,23 @@
     }
     return 0;
   }
-  function chooseBestArtwork(artworks) {
-    if (!artworks || artworks.length === 0) return null;
+  function rankArtworkUrls(artworks) {
+    if (!artworks || artworks.length === 0) return [];
     const sorted = [...artworks].sort((a, b) => parseSize(b.sizes) - parseSize(a.sizes));
-    const preferred = sorted.find((a) => parseSize(a.sizes) >= 96);
-    return (preferred || sorted[0])?.src || null;
+    const preferred = sorted.filter((a) => parseSize(a.sizes) >= 96);
+    const rest = sorted.filter((a) => parseSize(a.sizes) < 96);
+    const ordered = [...preferred, ...rest];
+    const urls = [];
+    const seen = /* @__PURE__ */ new Set();
+    for (const art of ordered.length > 0 ? ordered : sorted) {
+      if (!art || typeof art.src !== "string") continue;
+      const safe = safeImageUrl(art.src);
+      if (safe && !seen.has(safe)) {
+        seen.add(safe);
+        urls.push(safe);
+      }
+    }
+    return urls;
   }
   function sendCommand(tabId, frameId, cmd) {
     if (port) {
@@ -473,6 +485,13 @@
     sourceFavicon.className = "source-favicon";
     sourceFavicon.alt = "";
     sourceFavicon.referrerPolicy = "no-referrer";
+    sourceFavicon.addEventListener("error", () => {
+      sourceFavicon.dataset.failed = "1";
+      sourceFavicon.style.display = "none";
+    });
+    sourceFavicon.addEventListener("load", () => {
+      delete sourceFavicon.dataset.failed;
+    });
     const sourceHostname = document.createElement("span");
     sourceHostname.className = "source-hostname";
     sourceRow.appendChild(sourceFavicon);
@@ -804,6 +823,7 @@
       topRowEl,
       artworkContainer,
       artworkImg: null,
+      artworkRetryTimer: null,
       textColEl,
       sourceFavicon,
       sourceHostname,
@@ -1221,8 +1241,15 @@
     card.sourceHostname.textContent = hostname;
     const favicon = safeImageUrl(session.favIconUrl);
     if (favicon) {
-      if (card.sourceFavicon.getAttribute("src") !== favicon) card.sourceFavicon.src = favicon;
-      card.sourceFavicon.style.display = "block";
+      if (card.sourceFavicon.getAttribute("src") !== favicon) {
+        delete card.sourceFavicon.dataset.failed;
+        card.sourceFavicon.src = favicon;
+        card.sourceFavicon.style.display = "block";
+      } else if (card.sourceFavicon.dataset.failed) {
+        card.sourceFavicon.style.display = "none";
+      } else {
+        card.sourceFavicon.style.display = "block";
+      }
     } else {
       card.sourceFavicon.removeAttribute("src");
       card.sourceFavicon.style.display = "none";
@@ -1230,10 +1257,15 @@
     const meta = session.state?.metadata;
     card.titleEl.textContent = meta?.title || session.tabTitle || "Untitled audio";
     card.artistEl.textContent = meta?.artist || "";
-    const artwork = session.degraded ? null : safeImageUrl(chooseBestArtwork(meta?.artwork));
-    const imageKey = JSON.stringify([artwork, favicon]);
+    const artworkUrls = session.degraded ? [] : rankArtworkUrls(meta?.artwork);
+    const imageKey = JSON.stringify([artworkUrls, favicon]);
     if (card.artworkContainer.dataset.imageKey !== imageKey) {
       card.artworkContainer.dataset.imageKey = imageKey;
+      if (card.artworkRetryTimer !== null) {
+        window.clearTimeout(card.artworkRetryTimer);
+        card.artworkRetryTimer = null;
+      }
+      let artworkRetries = 0;
       const showFavicon = () => {
         if (card.artworkContainer.dataset.imageKey !== imageKey) return;
         card.artworkImg = null;
@@ -1245,19 +1277,50 @@
         fav.className = "artwork-fallback";
         fav.alt = "";
         fav.referrerPolicy = "no-referrer";
+        fav.onerror = () => {
+          if (card.artworkContainer.dataset.imageKey !== imageKey) return;
+          card.artworkContainer.replaceChildren();
+        };
         fav.src = favicon;
         card.artworkContainer.replaceChildren(fav);
       };
-      if (artwork) {
+      const scheduleArtworkRetry = () => {
+        if (card.artworkRetryTimer !== null || artworkRetries >= 4) return;
+        card.artworkRetryTimer = window.setTimeout(() => {
+          card.artworkRetryTimer = null;
+          artworkRetries++;
+          if (card.artworkContainer.dataset.imageKey !== imageKey) return;
+          if (card.artworkImg) return;
+          showArtworkAt(0);
+        }, 3e3);
+      };
+      const showArtworkAt = (index) => {
+        if (card.artworkContainer.dataset.imageKey !== imageKey) return;
+        if (index >= artworkUrls.length) {
+          showFavicon();
+          scheduleArtworkRetry();
+          return;
+        }
         const img = document.createElement("img");
         img.className = "artwork-img";
         img.alt = "";
         img.referrerPolicy = "no-referrer";
-        img.onerror = showFavicon;
-        img.src = artwork;
+        img.onload = () => {
+          if (card.artworkContainer.dataset.imageKey !== imageKey) return;
+          if (card.artworkRetryTimer !== null) {
+            window.clearTimeout(card.artworkRetryTimer);
+            card.artworkRetryTimer = null;
+          }
+        };
+        img.onerror = () => {
+          showArtworkAt(index + 1);
+        };
+        img.src = artworkUrls[index];
         card.artworkContainer.replaceChildren(img);
         card.artworkImg = img;
-      } else showFavicon();
+      };
+      if (artworkUrls.length > 0) showArtworkAt(0);
+      else showFavicon();
     }
     updatePlayButton(card);
     updateVolumeUI(card);
@@ -1323,6 +1386,10 @@
     const incomingTabIds = new Set(sessions.map((s) => s.tabId));
     for (const [tabId, card] of renderedCards.entries()) {
       if (!incomingTabIds.has(tabId)) {
+        if (card.artworkRetryTimer !== null) {
+          window.clearTimeout(card.artworkRetryTimer);
+          card.artworkRetryTimer = null;
+        }
         card.cardEl.remove();
         renderedCards.delete(tabId);
       }

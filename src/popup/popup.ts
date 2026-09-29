@@ -16,6 +16,7 @@ interface CardDom {
   topRowEl: HTMLElement;
   artworkContainer: HTMLElement;
   artworkImg: HTMLImageElement | null;
+  artworkRetryTimer: number | null;
   textColEl: HTMLElement;
   sourceFavicon: HTMLImageElement;
   sourceHostname: HTMLElement;
@@ -132,14 +133,30 @@ function parseSize(sizeStr?: string): number {
   return 0;
 }
 
-function chooseBestArtwork(artworks?: MediaArtwork[]): string | null {
-  if (!artworks || artworks.length === 0) return null;
-  // Sort descending by parsed resolution
+// Ordered best-first list of safe artwork URLs. The largest adequate image
+// (>= 96px) comes first, followed by the remaining candidates, so a broken
+// or slow largest URL falls through to the next working thumbnail instead
+// of sticking on the site favicon.
+function rankArtworkUrls(artworks?: MediaArtwork[]): string[] {
+  if (!artworks || artworks.length === 0) return [];
   const sorted = [...artworks].sort((a, b) => parseSize(b.sizes) - parseSize(a.sizes));
-  // Prefer artwork >= 96px
-  const preferred = sorted.find((a) => parseSize(a.sizes) >= 96);
-  return (preferred || sorted[0])?.src || null;
+  const preferred = sorted.filter((a) => parseSize(a.sizes) >= 96);
+  const rest = sorted.filter((a) => parseSize(a.sizes) < 96);
+  const ordered = [...preferred, ...rest];
+  const urls: string[] = [];
+  const seen = new Set<string>();
+  for (const art of ordered.length > 0 ? ordered : sorted) {
+    if (!art || typeof art.src !== "string") continue;
+    const safe = safeImageUrl(art.src);
+    if (safe && !seen.has(safe)) {
+      seen.add(safe);
+      urls.push(safe);
+    }
+  }
+  return urls;
 }
+
+
 
 function sendCommand(tabId: number, frameId: number, cmd: Command) {
   if (port) {
@@ -591,6 +608,14 @@ function createCardDom(session: Session): CardDom {
   sourceFavicon.className = "source-favicon";
   sourceFavicon.alt = "";
   sourceFavicon.referrerPolicy = "no-referrer";
+  // A dead favicon URL must stay hidden, never show a broken-image icon.
+  sourceFavicon.addEventListener("error", () => {
+    sourceFavicon.dataset.failed = "1";
+    sourceFavicon.style.display = "none";
+  });
+  sourceFavicon.addEventListener("load", () => {
+    delete sourceFavicon.dataset.failed;
+  });
 
   const sourceHostname = document.createElement("span");
   sourceHostname.className = "source-hostname";
@@ -980,6 +1005,7 @@ function createCardDom(session: Session): CardDom {
     topRowEl,
     artworkContainer,
     artworkImg: null,
+    artworkRetryTimer: null,
     textColEl,
     sourceFavicon,
     sourceHostname,
@@ -1484,8 +1510,16 @@ function updateCardDom(card: CardDom, session: Session) {
 
   const favicon = safeImageUrl(session.favIconUrl);
   if (favicon) {
-    if (card.sourceFavicon.getAttribute("src") !== favicon) card.sourceFavicon.src = favicon;
-    card.sourceFavicon.style.display = "block";
+    if (card.sourceFavicon.getAttribute("src") !== favicon) {
+      delete card.sourceFavicon.dataset.failed;
+      card.sourceFavicon.src = favicon;
+      card.sourceFavicon.style.display = "block";
+    } else if (card.sourceFavicon.dataset.failed) {
+      // Previous load of this URL failed; keep it hidden until the URL changes.
+      card.sourceFavicon.style.display = "none";
+    } else {
+      card.sourceFavicon.style.display = "block";
+    }
   } else {
     card.sourceFavicon.removeAttribute("src");
     card.sourceFavicon.style.display = "none";
@@ -1497,10 +1531,18 @@ function updateCardDom(card: CardDom, session: Session) {
 
   // Keep image nodes stable: repeated state updates must not trigger fresh
   // artwork requests. Remote artwork still needs a request to its host.
-  const artwork = session.degraded ? null : safeImageUrl(chooseBestArtwork(meta?.artwork));
-  const imageKey = JSON.stringify([artwork, favicon]);
+  // On load failure, fall through the remaining artwork candidates before
+  // settling on the site favicon, and retry once more shortly afterwards so
+  // a transient failure heals without requiring a track change.
+  const artworkUrls = session.degraded ? [] : rankArtworkUrls(meta?.artwork);
+  const imageKey = JSON.stringify([artworkUrls, favicon]);
   if (card.artworkContainer.dataset.imageKey !== imageKey) {
     card.artworkContainer.dataset.imageKey = imageKey;
+    if (card.artworkRetryTimer !== null) {
+      window.clearTimeout(card.artworkRetryTimer);
+      card.artworkRetryTimer = null;
+    }
+    let artworkRetries = 0;
     const showFavicon = () => {
       if (card.artworkContainer.dataset.imageKey !== imageKey) return;
       card.artworkImg = null;
@@ -1509,19 +1551,54 @@ function updateCardDom(card: CardDom, session: Session) {
       fav.className = "artwork-fallback";
       fav.alt = "";
       fav.referrerPolicy = "no-referrer";
+      fav.onerror = () => {
+        if (card.artworkContainer.dataset.imageKey !== imageKey) return;
+        card.artworkContainer.replaceChildren();
+      };
       fav.src = favicon;
       card.artworkContainer.replaceChildren(fav);
     };
-    if (artwork) {
+    const scheduleArtworkRetry = () => {
+      if (card.artworkRetryTimer !== null || artworkRetries >= 4) return;
+      card.artworkRetryTimer = window.setTimeout(() => {
+        card.artworkRetryTimer = null;
+        artworkRetries++;
+        // Still the same wanted image and still showing the fallback?
+        if (card.artworkContainer.dataset.imageKey !== imageKey) return;
+        if (card.artworkImg) return;
+        showArtworkAt(0);
+      }, 3000);
+    };
+    const showArtworkAt = (index: number) => {
+      if (card.artworkContainer.dataset.imageKey !== imageKey) return;
+      if (index >= artworkUrls.length) {
+        showFavicon();
+        // All candidates failed: the failure may be transient (slow CDN,
+        // tracking protection, popup opened mid-navigation), so try the
+        // list again shortly instead of sticking on the favicon.
+        scheduleArtworkRetry();
+        return;
+      }
       const img = document.createElement("img");
       img.className = "artwork-img";
       img.alt = "";
       img.referrerPolicy = "no-referrer";
-      img.onerror = showFavicon;
-      img.src = artwork;
+      img.onload = () => {
+        if (card.artworkContainer.dataset.imageKey !== imageKey) return;
+        if (card.artworkRetryTimer !== null) {
+          window.clearTimeout(card.artworkRetryTimer);
+          card.artworkRetryTimer = null;
+        }
+      };
+      img.onerror = () => {
+        showArtworkAt(index + 1);
+      };
+      img.src = artworkUrls[index];
       card.artworkContainer.replaceChildren(img);
       card.artworkImg = img;
-    } else showFavicon();
+    };
+    if (artworkUrls.length > 0) showArtworkAt(0);
+    else showFavicon();
   }
 
   // 3. Play button
@@ -1615,6 +1692,10 @@ function updateSessionsView(sessions: Session[]) {
   // Prune removed cards
   for (const [tabId, card] of renderedCards.entries()) {
     if (!incomingTabIds.has(tabId)) {
+      if (card.artworkRetryTimer !== null) {
+        window.clearTimeout(card.artworkRetryTimer);
+        card.artworkRetryTimer = null;
+      }
       card.cardEl.remove();
       renderedCards.delete(tabId);
     }
